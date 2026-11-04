@@ -18,8 +18,10 @@ from dite.flow.api import PipelineOptions, PipelineResult, PipelineService
 from dite.util.api import build_sync_openai_client
 from dite.validation import (
     build_constraint_metrics,
+    build_partition_metrics,
     build_structure_metrics,
     load_validation_corpus,
+    partition_metrics_payload,
 )
 
 
@@ -218,6 +220,7 @@ def _compare_inputs(
                 "constraint_metrics": _constraint_metrics_payload(
                     with_filename, corpus
                 ),
+                "partition_metrics": _partition_metrics_payload(with_filename, corpus),
                 "diagnostics": _cluster_diagnostics(with_filename),
                 "assignments": with_assignments,
             },
@@ -234,6 +237,7 @@ def _compare_inputs(
                 "constraint_metrics": _constraint_metrics_payload(
                     content_only, corpus
                 ),
+                "partition_metrics": _partition_metrics_payload(content_only, corpus),
                 "diagnostics": _cluster_diagnostics(content_only),
                 "assignments": content_assignments,
             },
@@ -379,13 +383,17 @@ def _run_sweep(
                 "process_metrics": _process_metrics(result),
                 "structure_metrics": _structure_metrics_payload(result),
                 "constraint_metrics": _constraint_metrics_payload(result, corpus),
+                "partition_metrics": _partition_metrics_payload(result, corpus),
                 "diagnostics": _cluster_diagnostics(result),
                 "assignments": _assignments(result),
                 "fragmentation_score": _fragmentation_score(result),
             }
         )
+    # With a labeled manifest, rank by agreement with the gold groups first;
+    # the unlabeled fragmentation heuristic only breaks ties.
     runs.sort(
         key=lambda item: (
+            -((item.get("partition_metrics") or {}).get("bcubed_f1") or 0.0),
             item["fragmentation_score"],
             item["summary"]["num_noise"],
             item["summary"]["final_num_clusters"],
@@ -421,6 +429,12 @@ def _constraint_metrics_payload(result: PipelineResult, corpus) -> dict[str, Any
         "cluster_id_fragmentation_by_id": metrics.cluster_id_fragmentation_by_id,
         "cluster_id_purity_by_id": metrics.cluster_id_purity_by_id,
     }
+
+
+def _partition_metrics_payload(result: PipelineResult, corpus) -> dict[str, Any] | None:
+    if corpus is None:
+        return None
+    return partition_metrics_payload(build_partition_metrics(result, corpus))
 
 
 def _structure_metrics_payload(result: PipelineResult) -> dict[str, Any]:

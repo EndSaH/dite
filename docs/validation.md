@@ -466,6 +466,18 @@ validation/
 
 如果一个方案只是让噪音变少，但靠的是把边界文件粗暴塞进大簇，它也应当被判为失败。
 
+### 标准外部指标
+
+有 `manifest.json` 的目录，`scan` 报告和 `tools/cluster_experiments.py` 的每个 run 都会输出 `partition_metrics`，拿 `cluster_id` 当金标准：
+
+- `bcubed_precision`：逐文件看"和我分在一起的文件里，有多少本来就该在一起"。下降说明误并（问题 2）。
+- `bcubed_recall`：逐文件看"本该和我在一起的文件，有多少真的和我分在一起"。下降说明拆簇或被留成噪音（问题 1、3）。
+- `bcubed_f1`：两者的调和平均。sweep 有标注时按它排序，`fragmentation_score` 只用来打破平局。
+- `adjusted_rand_index`、`adjusted_mutual_info`：整体分区一致度，便于和文献、其他工具横向比较。随机分区约为 0，完全一致为 1。
+- `predicted_noise_rate`：有标注的文件里被留成噪音的比例。
+
+噪音的处理规则：预测为噪音（`-1`）的文件，以及标注为 `noise_misc`（或任何 `noise_` 开头的 `cluster_id`）的文件，都各自算作单独一类。这样"留着不分"只会拉低召回，不会拉低精确率；把两个金标准噪音文件并到一起会被算作误并。清单里有、但结果里没有的文件按噪音计。
+
 ## 默认参数晋升门槛
 
 任何新的默认参数，必须同时满足下面这些条件。
@@ -480,6 +492,7 @@ validation/
 
 建议采用下面的硬门槛：
 
+- 有标注的目录上，`bcubed_f1` 不低于当前默认值，且 `bcubed_precision` 不能下降（不接受用误并换召回）
 - `fragmentation_score` 下降，或者至少不高于当前默认值
 - `num_noise` 不能明显恶化
 - 文件级人工复核中，不能新增高置信度误并

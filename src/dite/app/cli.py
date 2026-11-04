@@ -41,8 +41,10 @@ from dite.util.llm import format_api_error
 from dite.util.log import get_logger, setup_logging
 from dite.validation import (
     build_constraint_metrics,
+    build_partition_metrics,
     build_structure_metrics,
     load_validation_corpus,
+    partition_metrics_payload,
 )
 
 if TYPE_CHECKING:
@@ -286,6 +288,7 @@ def _build_report(
     """构建聚类报告"""
     structure_metrics_payload = None
     constraint_metrics_payload = None
+    partition_metrics = None
     if embeddings is not None:
         structure_metrics = build_structure_metrics(
             type(
@@ -307,16 +310,17 @@ def _build_report(
         manifest_path = validation_root / "manifest.json"
         if manifest_path.exists():
             corpus = load_validation_corpus(validation_root, manifest_path=manifest_path)
-            constraint_metrics = build_constraint_metrics(
-                type(
-                    "_ConstraintResult",
-                    (),
-                    {
-                        "files": files,
-                        "labels": labels,
-                    },
-                )(),
-                corpus,
+            labeled_result = type(
+                "_ConstraintResult",
+                (),
+                {
+                    "files": files,
+                    "labels": labels,
+                },
+            )()
+            constraint_metrics = build_constraint_metrics(labeled_result, corpus)
+            partition_metrics = partition_metrics_payload(
+                build_partition_metrics(labeled_result, corpus)
             )
             constraint_metrics_payload = {
                 "must_link_total": constraint_metrics.must_link_total,
@@ -343,6 +347,7 @@ def _build_report(
         cluster_representations=cluster_representations,
         structure_metrics=structure_metrics_payload,
         constraint_metrics=constraint_metrics_payload,
+        partition_metrics=partition_metrics,
     )
 
 

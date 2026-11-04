@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
+from sklearn.metrics import adjusted_mutual_info_score, adjusted_rand_score
 
 from .manifest import ValidationCorpus
 
@@ -41,16 +42,142 @@ class StructureMetrics:
     filename_bias_rate: float | None = None
 
 
+@dataclass(frozen=True)
+class PartitionMetrics:
+    """Standard external clustering metrics against manifest ``cluster_id``s.
+
+    Noise is never a cluster: a file left as noise (-1), or labeled with a
+    gold noise id such as ``noise_misc``, counts as its own singleton. That
+    way leaving files unsorted costs recall but never precision, and gold
+    noise files are not rewarded for being lumped together.
+
+    BCubed precision drops when unrelated files are merged; BCubed recall
+    drops when a gold group is split or left as noise.
+    """
+
+    num_labeled_files: int = 0
+    num_evaluated_files: int = 0
+    adjusted_rand_index: float | None = None
+    adjusted_mutual_info: float | None = None
+    bcubed_precision: float | None = None
+    bcubed_recall: float | None = None
+    bcubed_f1: float | None = None
+    predicted_noise_rate: float | None = None
+
+
+def is_gold_noise_cluster_id(cluster_id: str) -> bool:
+    """Return whether a manifest ``cluster_id`` marks files with no group."""
+    lowered = cluster_id.casefold()
+    return lowered == "noise" or lowered.startswith("noise_")
+
+
+def _assignments_by_relative_path(
+    result: PipelineResult,
+    corpus: ValidationCorpus,
+) -> dict[str, int]:
+    """Map manifest-style relative paths (POSIX separators) to labels."""
+    assignments: dict[str, int] = {}
+    for path, label in zip(result.files, result.labels, strict=True):
+        resolved = path.resolve()
+        if not resolved.is_relative_to(corpus.root):
+            continue
+        assignments[resolved.relative_to(corpus.root).as_posix()] = int(label)
+    return assignments
+
+
+def _bcubed(gold: list[str], predicted: list[str]) -> tuple[float, float]:
+    """Return BCubed precision and recall for two flat labelings."""
+    pair_counts = Counter(zip(predicted, gold, strict=True))
+    predicted_sizes = Counter(predicted)
+    gold_sizes = Counter(gold)
+    total = len(gold)
+    precision = (
+        sum(
+            count * count / predicted_sizes[pred]
+            for (pred, _gold), count in pair_counts.items()
+        )
+        / total
+    )
+    recall = (
+        sum(
+            count * count / gold_sizes[gold_id]
+            for (_pred, gold_id), count in pair_counts.items()
+        )
+        / total
+    )
+    return precision, recall
+
+
+def build_partition_metrics(
+    result: PipelineResult,
+    corpus: ValidationCorpus,
+) -> PartitionMetrics:
+    """Compare predicted labels with manifest ``cluster_id`` groups.
+
+    Labeled files missing from the result are evaluated as predicted noise.
+    """
+    assignments = _assignments_by_relative_path(result, corpus)
+    gold: list[str] = []
+    predicted: list[str] = []
+    predicted_noise = 0
+    for relative_path, cluster_id in sorted(corpus.cluster_ids_by_path.items()):
+        label = assignments.get(relative_path, -1)
+        if is_gold_noise_cluster_id(cluster_id):
+            gold.append(f"gold-noise:{relative_path}")
+        else:
+            gold.append(f"gold:{cluster_id}")
+        if label == -1:
+            predicted_noise += 1
+            predicted.append(f"pred-noise:{relative_path}")
+        else:
+            predicted.append(f"pred:{label}")
+
+    total = len(gold)
+    if total == 0:
+        return PartitionMetrics()
+    precision, recall = _bcubed(gold, predicted)
+    f1 = (
+        2 * precision * recall / (precision + recall) if precision + recall > 0 else 0.0
+    )
+    evaluated = sum(1 for path in corpus.cluster_ids_by_path if path in assignments)
+    ari = ami = None
+    if total >= 2:
+        ari = float(adjusted_rand_score(gold, predicted))
+        ami = float(adjusted_mutual_info_score(gold, predicted))
+    return PartitionMetrics(
+        num_labeled_files=total,
+        num_evaluated_files=evaluated,
+        adjusted_rand_index=ari,
+        adjusted_mutual_info=ami,
+        bcubed_precision=float(precision),
+        bcubed_recall=float(recall),
+        bcubed_f1=float(f1),
+        predicted_noise_rate=predicted_noise / total,
+    )
+
+
+def partition_metrics_payload(
+    metrics: PartitionMetrics,
+) -> dict[str, float | int | None]:
+    """Return a JSON-ready dict for reports and experiment output."""
+    return {
+        "num_labeled_files": metrics.num_labeled_files,
+        "num_evaluated_files": metrics.num_evaluated_files,
+        "adjusted_rand_index": metrics.adjusted_rand_index,
+        "adjusted_mutual_info": metrics.adjusted_mutual_info,
+        "bcubed_precision": metrics.bcubed_precision,
+        "bcubed_recall": metrics.bcubed_recall,
+        "bcubed_f1": metrics.bcubed_f1,
+        "predicted_noise_rate": metrics.predicted_noise_rate,
+    }
+
+
 def build_constraint_metrics(
     result: PipelineResult,
     corpus: ValidationCorpus,
 ) -> ConstraintMetrics:
     """Build external validation metrics using the loaded manifest constraints."""
-    assignments = {
-        str(path.relative_to(corpus.root)): int(label)
-        for path, label in zip(result.files, result.labels, strict=True)
-        if path.resolve().is_relative_to(corpus.root)
-    }
+    assignments = _assignments_by_relative_path(result, corpus)
 
     must_link_hits = 0
     for left, right in corpus.constraints.must_link_pairs:
@@ -139,10 +266,13 @@ def _compute_density_validation_score(
 
 
 def _compute_filename_bias_rate(result: PipelineResult) -> float | None:
+    # Imported here: dite.cluster pulls in dite.app, whose CLI imports this
+    # module at load time.
+    from dite.cluster.model import CONTENT_BACKED_EDGE_TYPES
+
     if not result.document_features or not result.candidate_edges:
         return None
 
-    feature_by_id = {feature.file_id: feature for feature in result.document_features}
     label_by_id = {
         feature.file_id: int(label)
         for feature, label in zip(result.document_features, result.labels, strict=True)
@@ -155,7 +285,7 @@ def _compute_filename_bias_rate(result: PipelineResult) -> float | None:
         right_label = label_by_id.get(edge.target_id, -1)
         if left_label == -1 or right_label == -1 or left_label != right_label:
             continue
-        if edge.edge_type == "content_similarity":
+        if edge.edge_type in CONTENT_BACKED_EDGE_TYPES:
             cluster_content_support[left_label] = True
         elif edge.edge_type in {"filename_similarity", "title_match"}:
             cluster_metadata_only_support[left_label] = True
@@ -167,10 +297,9 @@ def _compute_filename_bias_rate(result: PipelineResult) -> float | None:
         if label == -1:
             continue
         eligible += 1
-        if (
-            cluster_metadata_only_support.get(label, False)
-            and not cluster_content_support.get(label, False)
-        ):
+        if cluster_metadata_only_support.get(
+            label, False
+        ) and not cluster_content_support.get(label, False):
             biased += 1
 
     if eligible == 0:

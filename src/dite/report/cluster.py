@@ -31,6 +31,7 @@ def build_report(
     cluster_representations=None,
     structure_metrics=None,
     constraint_metrics=None,
+    partition_metrics=None,
 ) -> dict:
     """Build a structured clustering report for CLI and JSON output."""
     from dite.cluster.api import _build_cluster_debug_labels
@@ -112,6 +113,7 @@ def build_report(
             ),
         },
         "constraint_metrics": constraint_metrics or {},
+        "partition_metrics": partition_metrics or {},
         "clusters": [clusters[label] for label in sorted(clusters)],
         "cluster_diagnostics": {
             "small_cluster_merge_max_similarity": (

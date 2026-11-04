@@ -9,8 +9,10 @@ import pytest
 from dite.flow.api import PipelineResult
 from dite.validation import (
     build_constraint_metrics,
+    build_partition_metrics,
     build_structure_metrics,
     load_validation_corpus,
+    partition_metrics_payload,
 )
 
 
@@ -164,9 +166,132 @@ def test_build_constraint_metrics_counts_fragmentation(tmp_path: Path) -> None:
     assert metrics.cluster_id_purity_by_id["group_1"] == pytest.approx(1 / 3)
 
 
-def test_build_structure_metrics_returns_none_without_feature_edges(tmp_path: Path) -> None:
+def test_build_structure_metrics_returns_none_without_feature_edges(
+    tmp_path: Path,
+) -> None:
     result = _pipeline_result(tmp_path, [0, 0, -1])
 
     metrics = build_structure_metrics(result)
 
     assert metrics.filename_bias_rate is None
+
+
+def _labeled_corpus(root: Path, groups: dict[str, str]):
+    for name in groups:
+        (root / name).write_text(name, encoding="utf-8")
+    _write_manifest(
+        root,
+        {
+            "name": "sample",
+            "tier": "representative",
+            "description": "demo",
+            "owner": "team",
+            "files": [
+                {"path": name, "cluster_id": cluster_id}
+                for name, cluster_id in groups.items()
+            ],
+        },
+    )
+    return load_validation_corpus(root)
+
+
+def _labeled_result(root: Path, labels: dict[str, int]) -> PipelineResult:
+    names = sorted(labels)
+    return PipelineResult(
+        files=[root / name for name in names],
+        contents=["x"] * len(names),
+        embeddings=np.zeros((len(names), 2), dtype=np.float32),
+        labels=np.array([labels[name] for name in names], dtype=int),
+        cluster_names={},
+    )
+
+
+def test_partition_metrics_are_perfect_for_matching_partition(tmp_path: Path) -> None:
+    corpus = _labeled_corpus(
+        tmp_path,
+        {"a.txt": "ml", "b.txt": "ml", "c.txt": "finance", "d.txt": "finance"},
+    )
+    result = _labeled_result(tmp_path, {"a.txt": 7, "b.txt": 7, "c.txt": 2, "d.txt": 2})
+
+    metrics = build_partition_metrics(result, corpus)
+
+    assert metrics.num_labeled_files == 4
+    assert metrics.num_evaluated_files == 4
+    assert metrics.adjusted_rand_index == pytest.approx(1.0)
+    assert metrics.adjusted_mutual_info == pytest.approx(1.0)
+    assert metrics.bcubed_precision == pytest.approx(1.0)
+    assert metrics.bcubed_recall == pytest.approx(1.0)
+    assert metrics.bcubed_f1 == pytest.approx(1.0)
+    assert metrics.predicted_noise_rate == 0.0
+
+
+def test_partition_metrics_separate_over_merge_from_fragmentation(
+    tmp_path: Path,
+) -> None:
+    corpus = _labeled_corpus(
+        tmp_path,
+        {"a.txt": "ml", "b.txt": "ml", "c.txt": "finance", "d.txt": "finance"},
+    )
+
+    merged = build_partition_metrics(
+        _labeled_result(tmp_path, {"a.txt": 0, "b.txt": 0, "c.txt": 0, "d.txt": 0}),
+        corpus,
+    )
+    # Everything in one cluster: each file's cluster is half wrong.
+    assert merged.bcubed_precision == pytest.approx(0.5)
+    assert merged.bcubed_recall == pytest.approx(1.0)
+
+    split = build_partition_metrics(
+        _labeled_result(tmp_path, {"a.txt": 0, "b.txt": 1, "c.txt": 2, "d.txt": 3}),
+        corpus,
+    )
+    # Every file alone: nothing wrong is merged, but each group is split.
+    assert split.bcubed_precision == pytest.approx(1.0)
+    assert split.bcubed_recall == pytest.approx(0.5)
+    assert split.adjusted_rand_index == pytest.approx(0.0)
+
+
+def test_partition_metrics_treat_noise_as_singletons(tmp_path: Path) -> None:
+    corpus = _labeled_corpus(
+        tmp_path,
+        {
+            "a.txt": "ml",
+            "b.txt": "ml",
+            "x.txt": "noise_misc",
+            "y.txt": "noise_misc",
+        },
+    )
+
+    # Predicted noise never counts as a shared cluster, and two gold-noise
+    # files lumped together are a false merge, not a hit.
+    metrics = build_partition_metrics(
+        _labeled_result(tmp_path, {"a.txt": -1, "b.txt": -1, "x.txt": 5, "y.txt": 5}),
+        corpus,
+    )
+
+    assert metrics.predicted_noise_rate == pytest.approx(0.5)
+    # a, b: precision 1 (alone), recall 1/2. x, y: precision 1/2, recall 1.
+    assert metrics.bcubed_precision == pytest.approx(0.75)
+    assert metrics.bcubed_recall == pytest.approx(0.75)
+
+
+def test_partition_metrics_count_missing_files_as_noise(tmp_path: Path) -> None:
+    corpus = _labeled_corpus(tmp_path, {"a.txt": "ml", "b.txt": "ml"})
+
+    metrics = build_partition_metrics(_labeled_result(tmp_path, {"a.txt": 0}), corpus)
+
+    assert metrics.num_labeled_files == 2
+    assert metrics.num_evaluated_files == 1
+    assert metrics.predicted_noise_rate == pytest.approx(0.5)
+    assert metrics.bcubed_recall == pytest.approx(0.5)
+
+
+def test_partition_metrics_payload_is_json_ready(tmp_path: Path) -> None:
+    corpus = _labeled_corpus(tmp_path, {"a.txt": "ml", "b.txt": "ml"})
+    metrics = build_partition_metrics(
+        _labeled_result(tmp_path, {"a.txt": 0, "b.txt": 0}), corpus
+    )
+
+    payload = partition_metrics_payload(metrics)
+
+    assert json.loads(json.dumps(payload))["bcubed_f1"] == pytest.approx(1.0)

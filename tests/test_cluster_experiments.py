@@ -164,6 +164,9 @@ def test_sweep_reports_fragmentation_score(monkeypatch, tmp_path: Path) -> None:
     assert report["runs"][0]["summary"]["num_noise"] == 1
     assert report["runs"][0]["process_metrics"]["num_files_total"] == 1
     assert report["runs"][0]["constraint_metrics"]["cluster_id_fragmentation_total"] == 0
+    partition = report["runs"][0]["partition_metrics"]
+    assert partition["num_labeled_files"] == 1
+    assert partition["predicted_noise_rate"] == 1.0
 
 
 def test_emit_writes_json_file(tmp_path: Path) -> None:
