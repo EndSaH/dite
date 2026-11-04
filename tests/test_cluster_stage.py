@@ -18,7 +18,11 @@ from dite.cluster.model import (
     ClusterMetrics,
     ClusterResult,
 )
-from dite.cluster.stage import apply_adjudication_links, cluster_canonical_documents
+from dite.cluster.stage import (
+    apply_adjudication_links,
+    build_canonical_cluster_stage,
+    cluster_canonical_documents,
+)
 from dite.doc import build_document_features
 from dite.flow.model import PipelineOptions
 
@@ -368,3 +372,78 @@ def test_graph_mode_uses_configured_component_edge_threshold() -> None:
 
     assert _run(0.9) == [0, 0]
     assert _run(0.97) == [-1, -1]
+
+
+def _run_stage_capturing_embedding_texts(input_mode: str) -> list[str]:
+    files = [Path("docs/eigen.md"), Path("docs/budget.md")]
+    contents = [
+        "<!-- image -->\n## Eigenvalues\nLet A be a square matrix. " * 3,
+        "Household budget\nMonthly spending and savings plan.",
+    ]
+    captured: list[str] = []
+
+    def _vectorize(files_arg, hashes_arg, texts, options_arg):
+        del files_arg, hashes_arg, options_arg
+        captured.extend(texts)
+        return np.eye(len(texts), dtype=np.float32)
+
+    build_canonical_cluster_stage(
+        files=files,
+        contents=contents,
+        file_hashes=["h0", "h1"],
+        file_reports=[None, None],
+        canonical_indices=[0, 1],
+        options=PipelineOptions(embedding_input_mode=input_mode),
+        config=Config(),
+        client=None,
+        request_runtime=None,
+        vectorize=_vectorize,
+        expand_noise_repaired_count=lambda *args: 0,
+        cluster_documents_fn=_all_noise_cluster_fn,
+    )
+    return captured
+
+
+def test_summary_input_mode_embeds_feature_summaries() -> None:
+    raw = _run_stage_capturing_embedding_texts("with_filename")
+    summary = _run_stage_capturing_embedding_texts("summary")
+
+    assert raw[0].startswith("<!-- image -->")
+    assert summary[0].startswith("Title: Eigenvalues")
+    assert "<!-- image -->" not in summary[0]
+    assert summary[1].startswith("Title: Household budget")
+
+
+def test_embedding_cache_key_changes_with_excerpt_settings(tmp_path: Path) -> None:
+    from dite.flow.vector import vectorize_files
+
+    class _Cache:
+        def __init__(self) -> None:
+            self.versions: list[str] = []
+
+        def get_embedding(self, file, file_hash, *, required_model_version):
+            del file, file_hash
+            self.versions.append(required_model_version)
+            return np.array([1.0, 0.0], dtype=np.float32)
+
+    def _run(config: Config) -> str:
+        cache = _Cache()
+        vectorize_files(
+            files=[tmp_path / "a.md"],
+            file_hashes=["h"],
+            contents=["text"],
+            options=PipelineOptions(),
+            config=config,
+            cache=cache,
+            client=None,
+            logger=type("_Logger", (), {"debug": lambda self, message: None})(),
+            get_embeddings_fn=None,
+        )
+        return cache.versions[0]
+
+    default_version = _run(Config())
+    changed = Config()
+    changed.processing.text_truncate_limit = 8000
+
+    assert "excerpt=" not in default_version
+    assert _run(changed).endswith("|excerpt=8000:0.6:0.2")

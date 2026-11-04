@@ -188,10 +188,15 @@ uv run python tools/cluster_experiments.py sweep docs/test/valid --output "$OUTD
 
 只有当基础 sweep 没给出清晰信号时，才跑这一阶段。
 
-当前扩展实验只允许：
+当前扩展实验包括：
 
 - `PCA`
 - `allow_single_cluster`
+- `topic_clustering.mode: agglomerative`（自动轮廓系数切分，以及余弦距离阈值 0.3 / 0.4 / 0.5）
+- `reducer: umap`（5 维和 10 维；只有装了 `umap-learn` 才会加入）
+- `embedding_input_mode: summary`（默认 HDBSCAN 参数和上面几种替代聚类各跑一次）
+
+有 `manifest.json` 时，结果按 `partition_metrics.bcubed_f1` 排序。判读时同时看 `bcubed_precision` 有没有下降：只涨召回、精确率掉了的方案，等于用误并换来的，不能晋升默认值。
 
 命令：
 

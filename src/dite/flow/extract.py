@@ -190,6 +190,8 @@ def extract_content_work_item(
         content=ContentTruncator.truncate_smart(
             resolved.final_content,
             max_chars=truncate_limit,
+            head_ratio=config.processing.excerpt_head_ratio,
+            middle_ratio=config.processing.excerpt_middle_ratio,
         ),
         file_hash=file_hash,
         report=ExtractionFileReport(

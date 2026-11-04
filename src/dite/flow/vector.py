@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from dite.doc.embed import get_embedding_cache_version, normalize_embeddings
+from dite.doc.embed import (
+    get_embedding_cache_variant,
+    get_embedding_cache_version,
+    normalize_embeddings,
+)
 
 
 def expand_by_file_hashes(
@@ -78,6 +82,7 @@ def vectorize_files(
         cache_model_version = get_embedding_cache_version(
             embedding_model,
             options.embedding_input_mode,
+            variant=get_embedding_cache_variant(config, options.embedding_input_mode),
         )
 
         for i, (file, content, file_hash) in enumerate(

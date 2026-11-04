@@ -29,6 +29,7 @@ from dite.cluster.model import (
     ClusterDraft,
 )
 from dite.doc import DocumentFeatures, build_document_features
+from dite.doc.build import build_summary_embedding_text
 from dite.doc.embed import normalize_embeddings
 
 from .model import ClusterMetrics, ClusterResult
@@ -462,10 +463,16 @@ def build_canonical_cluster_stage(
     canonical_document_features = [
         document_features[index] for index in canonical_indices
     ]
+    embedding_texts = canonical_contents
+    if options.embedding_input_mode == "summary":
+        embedding_texts = [
+            build_summary_embedding_text(feature)
+            for feature in canonical_document_features
+        ]
     canonical_embeddings = vectorize(
         canonical_files,
         canonical_hashes,
-        canonical_contents,
+        embedding_texts,
         options,
     )
     canonical_embeddings = normalize_embeddings(canonical_embeddings)

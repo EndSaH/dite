@@ -313,6 +313,8 @@ class PipelineService:
             content=ContentTruncator.truncate_smart(
                 resolved.final_content,
                 max_chars=truncate_limit,
+                head_ratio=self.config.processing.excerpt_head_ratio,
+                middle_ratio=self.config.processing.excerpt_middle_ratio,
             ),
             file_hash=file_hash,
             report=ExtractionFileReport(

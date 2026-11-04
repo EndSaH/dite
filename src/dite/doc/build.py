@@ -21,7 +21,6 @@ from dite.doc.model import (
 _EXCERPT_LIMIT = 200
 _SHORT_TEXT_THRESHOLD = 100
 _FAILED_TEXT_THRESHOLD = 10
-_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]+")
 _STOPWORDS = {
     "the",
     "and",
@@ -109,9 +108,81 @@ _GENERIC_TITLE_PATTERNS = (
 )
 
 
+_TERM_PATTERN = re.compile(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+")
+# Frequent function-word bigrams that would otherwise dominate CJK keywords.
+_CJK_STOP_BIGRAMS = {
+    "一个",
+    "以及",
+    "所以",
+    "因为",
+    "如果",
+    "可以",
+    "我们",
+    "他们",
+    "你们",
+    "这个",
+    "那个",
+    "这些",
+    "那些",
+    "进行",
+    "通过",
+    "没有",
+    "就是",
+    "不是",
+    "什么",
+    "已经",
+    "其中",
+    "之间",
+    "以下",
+    "以上",
+    "对于",
+    "由于",
+    "但是",
+    "并且",
+    "或者",
+}
+
+
+# Bigrams containing one of these usually straddle a word boundary
+# ("与特" in "特征值与特征向量"), so they are skipped as keywords.
+_CJK_FUNCTION_CHARS = set(
+    "的了是在和与及或等为以对于从将把被也都而之其个这那我你他它们中上下"
+)
+
+
+def _is_keyword_token(token: str) -> bool:
+    if token in _STOPWORDS or token in _CJK_STOP_BIGRAMS:
+        return False
+    return not (_is_cjk(token) and any(ch in _CJK_FUNCTION_CHARS for ch in token))
+
+
+def _is_cjk(term: str) -> bool:
+    return bool(_CJK_PATTERN.match(term))
+
+
 def _tokenize_text(text: str) -> list[str]:
-    """Return normalized coarse tokens from a file name or path fragment."""
-    return [token.casefold() for token in _TOKEN_PATTERN.findall(text)]
+    """Return normalized tokens from text, a file name or a path fragment.
+
+    Latin letters and digits form word tokens. Chinese has no spaces, so a run
+    of CJK characters is split into overlapping character bigrams (a single
+    character stays as is). Treating a whole run as one token made every
+    Chinese sentence a unique "keyword" and made Chinese file names match
+    only when identical.
+    """
+    tokens: list[str] = []
+    for term in _TERM_PATTERN.findall(text):
+        if not _is_cjk(term):
+            tokens.append(term.casefold())
+        elif len(term) == 1:
+            tokens.append(term)
+        else:
+            tokens.extend(term[index : index + 2] for index in range(len(term) - 1))
+    return tokens
+
+
+def _display_terms(text: str) -> list[str]:
+    """Return word-like terms for display, keeping CJK runs whole."""
+    return [term.casefold() for term in _TERM_PATTERN.findall(text)]
 
 
 def strip_markup(text: str) -> str:
@@ -188,7 +259,7 @@ def _infer_keywords_and_topic(
     tokens = [
         token
         for token in _tokenize_text(strip_markup(content))
-        if token not in _STOPWORDS
+        if _is_keyword_token(token)
     ]
     counts: dict[str, int] = {}
     for token in tokens:
@@ -198,7 +269,7 @@ def _infer_keywords_and_topic(
     if title_candidates:
         title_tokens = [
             token
-            for token in _tokenize_text(title_candidates[0])
+            for token in _display_terms(title_candidates[0])
             if token not in _STOPWORDS
         ]
         if title_tokens:
@@ -315,7 +386,7 @@ def build_document_features(
             else content
         ),
         language=language,
-        token_count_estimate=len(_TOKEN_PATTERN.findall(content)),
+        token_count_estimate=len(_tokenize_text(content)),
         summary=summary,
         metadata=MetadataFeatures(
             file_name_tokens=_tokenize_text(file_path.stem),
@@ -328,3 +399,44 @@ def build_document_features(
         selected_source=str(selected_source),
         extraction_trace=extraction_trace,
     )
+
+
+SUMMARY_EMBEDDING_EXCERPT_CHARS = 1000
+
+
+def build_summary_embedding_text(
+    feature: DocumentFeatures,
+    *,
+    excerpt_chars: int = SUMMARY_EMBEDDING_EXCERPT_CHARS,
+) -> str:
+    """Build the ``summary`` embedding input from structured features.
+
+    Instead of a head/middle/tail cut of raw text, this embeds what the
+    document is about: its content title, summary, topic and keywords, plus a
+    short cleaned opening excerpt. With ``feature_extraction.analysis_enabled``
+    the summary, topic and keywords come from the LLM analyzer; otherwise they
+    are the deterministic title and keyword features. Formatting noise such
+    as tables, image placeholders and reference lists mostly drops out.
+    """
+    if not feature.content_text.strip():
+        # Nothing was extracted; any title or topic would come from the file
+        # name, so say so plainly instead of dressing it up as content.
+        return f"File name: {feature.name}"
+    stem_title = filename_title(feature.stem)
+    content_titles = [
+        title for title in feature.title_candidates if title != stem_title
+    ]
+    title = content_titles[0] if content_titles else ""
+    lines: list[str] = []
+    if title:
+        lines.append(f"Title: {title}")
+    if feature.summary and feature.summary not in {title, stem_title}:
+        lines.append(f"Summary: {feature.summary}")
+    if feature.topic:
+        lines.append(f"Topic: {feature.topic}")
+    if feature.keywords:
+        lines.append(f"Keywords: {', '.join(feature.keywords[:10])}")
+    excerpt = re.sub(r"\s+", " ", strip_markup(feature.content_text)).strip()
+    if excerpt:
+        lines.append(f"Excerpt: {excerpt[:excerpt_chars]}")
+    return "\n".join(lines) or f"File name: {feature.name}"

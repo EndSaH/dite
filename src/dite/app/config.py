@@ -84,6 +84,11 @@ class ProcessingConfig:
     """处理参数配置"""
 
     text_truncate_limit: int = 4000
+    # Share of the excerpt budget taken from the start and the middle of a
+    # long document; the end gets the rest. Tails are often references,
+    # indexes or copyright pages, so head-heavy splits are worth testing.
+    excerpt_head_ratio: float = 0.6
+    excerpt_middle_ratio: float = 0.2
     vlm_fallback_threshold: int = 100  # 有效内容少于此阈值时触发 VLM 回退
     docling_pdf_timeout_sec: float = 60.0
     docling_device: str = "auto"
@@ -366,6 +371,17 @@ def _dict_to_config(data: dict[str, Any]) -> Config:
 
     if "i18n" in data:
         config.i18n = I18nConfig(**data["i18n"])
+
+    processing = config.processing
+    if not (
+        0.0 <= processing.excerpt_head_ratio <= 1.0
+        and 0.0 <= processing.excerpt_middle_ratio <= 1.0
+        and processing.excerpt_head_ratio + processing.excerpt_middle_ratio <= 1.0
+    ):
+        raise ValueError(
+            "processing.excerpt_head_ratio and excerpt_middle_ratio must be "
+            "between 0 and 1 and sum to at most 1"
+        )
 
     topic = config.topic_clustering
     if topic.mode not in TOPIC_CLUSTERING_MODES:

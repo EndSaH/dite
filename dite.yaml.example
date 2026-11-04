@@ -46,6 +46,8 @@ clustering:
 # Processing Parameters
 processing:
   text_truncate_limit: 4000            # Smart excerpt limit used for downstream processing
+  excerpt_head_ratio: 0.6              # Share of the excerpt taken from the start
+  excerpt_middle_ratio: 0.2            # Share from the middle; the end gets the rest
   vlm_fallback_threshold: 100          # Final-output usability threshold used by pdf-check smoke checks
   docling_pdf_timeout_sec: 60          # Max seconds per Docling PDF extraction
   docling_device: auto                 # auto / cpu / cuda / cuda:N / mps

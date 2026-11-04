@@ -823,3 +823,51 @@ def test_build_document_features_can_use_optional_analysis() -> None:
     assert features.layout.document_type == "technical report"
     assert features.layout.has_table is True
     assert features.layout.has_image_heavy_layout is True
+
+
+def test_chinese_text_is_tokenized_into_bigrams() -> None:
+    features = build_document_features(
+        Path("数学/线性代数笔记.pdf"),
+        "线性代数\n矩阵的特征值与特征向量。我们可以通过特征多项式求特征值，"
+        "相似矩阵有相同的特征值。",
+    )
+
+    assert features.file_name_tokens == ["线性", "性代", "代数", "数笔", "笔记"]
+    assert features.parent_path_tokens == ["数学"]
+    assert features.keywords[0] == "特征"
+    assert "矩阵" in features.keywords
+    # Function-word bigrams and boundary bigrams are not keywords.
+    assert "我们" not in features.keywords
+    assert "与特" not in features.keywords
+    # The topic keeps the readable title instead of bigram fragments.
+    assert features.topic == "线性代数"
+
+
+def test_similar_chinese_file_names_now_overlap() -> None:
+    left = build_document_features(Path("a/线性代数期末复习.pdf"), "")
+    right = build_document_features(Path("b/线性代数期末复习 (1).pdf"), "")
+
+    edges = build_candidate_edges([left, right])
+
+    # Whole-run tokens made these two names share nothing at all.
+    assert [edge.edge_type for edge in edges] == ["filename_similarity"]
+
+
+def test_summary_embedding_text_uses_features_not_raw_layout() -> None:
+    from dite.doc.build import build_summary_embedding_text
+
+    feature = build_document_features(
+        Path("course/linear_algebra_ch2.pptx"),
+        "<!-- image -->\n\n## Eigenvalues and eigenvectors\n"
+        "| col | col |\n| --- | --- |\nLet A be a square matrix.",
+    )
+
+    text = build_summary_embedding_text(feature)
+
+    assert text.startswith("Title: Eigenvalues and eigenvectors")
+    assert "Keywords:" in text
+    assert "<!-- image -->" not in text
+    assert "linear algebra ch2" not in text
+
+    empty = build_document_features(Path("scans/scan_001.pdf"), "")
+    assert build_summary_embedding_text(empty) == "File name: scan_001.pdf"

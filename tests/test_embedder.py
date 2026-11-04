@@ -238,3 +238,60 @@ def test_get_embeddings_rejects_response_with_missing_vectors() -> None:
             config=Config(),
             input_mode="content_only",
         )
+
+
+def test_content_truncator_head_only_and_head_tail_splits() -> None:
+    content = ("HEAD-" * 30) + ("MIDDLE-" * 30) + ("TAIL-" * 30)
+
+    head_only = ContentTruncator.truncate_smart(
+        content, max_chars=120, head_ratio=1.0, middle_ratio=0.0
+    )
+    assert head_only == content[:120]
+
+    head_tail = ContentTruncator.truncate_smart(
+        content, max_chars=120, head_ratio=0.8, middle_ratio=0.0
+    )
+    assert len(head_tail) <= 120
+    assert head_tail.startswith("HEAD-")
+    assert head_tail.endswith("TAIL-")
+    assert "middle omitted" not in head_tail
+    assert "MIDDLE-" not in head_tail
+
+
+def test_embedding_cache_variant_tracks_excerpt_and_summary_settings() -> None:
+    from dite.doc.embed import get_embedding_cache_variant
+
+    config = Config()
+    assert get_embedding_cache_variant(config, "with_filename") is None
+
+    config.processing.text_truncate_limit = 8000
+    config.processing.excerpt_head_ratio = 0.8
+    config.processing.excerpt_middle_ratio = 0.2
+    variant = get_embedding_cache_variant(config, "with_filename")
+    assert variant == "excerpt=8000:0.8:0.2"
+    assert get_embedding_cache_version("m", variant=variant) == (
+        "m|input=filename-smart-content-normalized-v2|excerpt=8000:0.8:0.2"
+    )
+
+    summary_config = Config()
+    assert get_embedding_cache_variant(summary_config, "summary") == "analysis=off"
+    summary_config.feature_extraction.analysis_enabled = True
+    assert get_embedding_cache_variant(summary_config, "summary") == (
+        f"analysis={summary_config.models.llm}"
+    )
+
+
+def test_get_embeddings_summary_mode_embeds_prepared_text_verbatim() -> None:
+    client = _FakeClient()
+
+    get_embeddings(
+        client,
+        ["Title: Linear Algebra\nKeywords: matrix"],
+        config=Config(),
+        file_names=["notes.pdf"],
+        input_mode="summary",
+    )
+
+    assert client.embeddings.calls[0]["input"] == [
+        "Title: Linear Algebra\nKeywords: matrix"
+    ]

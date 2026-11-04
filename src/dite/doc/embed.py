@@ -9,22 +9,57 @@ from dite.app.config import Config
 from dite.app.i18n import t
 from dite.util.log import get_logger
 
-EmbeddingInputMode = Literal["with_filename", "content_only"]
+EmbeddingInputMode = Literal["with_filename", "content_only", "summary"]
 # Texts at or below this length are embedded from the file name alone in
 # ``with_filename`` mode, so their vectors carry filename evidence only.
 FILENAME_FALLBACK_MAX_CHARS = 10
 _EMBEDDING_INPUT_VERSIONS: dict[EmbeddingInputMode, str] = {
     "with_filename": "filename-smart-content-normalized-v2",
     "content_only": "content-only-normalized-v1",
+    "summary": "feature-summary-v1",
 }
 
 
 def get_embedding_cache_version(
     embedding_model: str,
     input_mode: EmbeddingInputMode = "with_filename",
+    *,
+    variant: str | None = None,
 ) -> str:
-    """Return the cache key for the current embedding input format."""
-    return f"{embedding_model}|input={_EMBEDDING_INPUT_VERSIONS[input_mode]}"
+    """Return the cache key for the current embedding input format.
+
+    ``variant`` records settings that change the embedded text without
+    changing the input mode (excerpt size and split, the analysis model for
+    summary inputs). It is omitted for default settings, so existing caches
+    stay valid.
+    """
+    version = f"{embedding_model}|input={_EMBEDDING_INPUT_VERSIONS[input_mode]}"
+    return f"{version}|{variant}" if variant else version
+
+
+def get_embedding_cache_variant(config: Config, input_mode: str) -> str | None:
+    """Describe non-default settings that change the embedded text."""
+    defaults = type(config.processing)()
+    processing = config.processing
+    parts: list[str] = []
+    excerpt = (
+        processing.text_truncate_limit,
+        processing.excerpt_head_ratio,
+        processing.excerpt_middle_ratio,
+    )
+    default_excerpt = (
+        defaults.text_truncate_limit,
+        defaults.excerpt_head_ratio,
+        defaults.excerpt_middle_ratio,
+    )
+    if excerpt != default_excerpt:
+        parts.append(f"excerpt={excerpt[0]}:{excerpt[1]:g}:{excerpt[2]:g}")
+    if input_mode == "summary":
+        analysis = (
+            config.models.llm if config.feature_extraction.analysis_enabled else "off"
+        )
+        parts.append(f"analysis={analysis}")
+    return ";".join(parts) or None
 
 
 def normalize_embeddings(embeddings: np.ndarray) -> np.ndarray:
@@ -69,6 +104,8 @@ def _build_embedding_input(
         fallback_name = file_name or f"file_{index}"
         return f"File name: {fallback_name}", fallback_name
 
+    # content_only, and summary (whose text is prepared from document
+    # features before this point): embed the text exactly as given.
     if stripped:
         return stripped, None
     return f"file_{index}", f"file_{index}"
@@ -219,15 +256,30 @@ class ContentTruncator:
     EMBEDDING_MAX_TOKENS = 8192
     CONTENT_BUDGET = 7500  # tokens
 
-    @staticmethod
-    def truncate_smart(content: str, max_chars: int = 15000) -> str:
-        """
-        智能截断：保留首尾重要信息，中间采样
+    DEFAULT_HEAD_RATIO = 0.6
+    DEFAULT_MIDDLE_RATIO = 0.2
+    _MIDDLE_MARKER = "\n\n[... middle omitted ...]\n\n"
+    _TAIL_MARKER = "\n\n[... omitted ...]\n\n"
 
-        策略：
+    @staticmethod
+    def truncate_smart(
+        content: str,
+        max_chars: int = 15000,
+        *,
+        head_ratio: float = DEFAULT_HEAD_RATIO,
+        middle_ratio: float = DEFAULT_MIDDLE_RATIO,
+    ) -> str:
+        """
+        智能截断：保留开头，按比例采样中段和结尾
+
+        默认策略：
         - 首部 60%：标题、摘要、引言通常在开头
         - 中部 20%：采样中间内容
-        - 尾部 20%：结论、参考文献通常在结尾
+        - 尾部 20%：结论通常在结尾，但参考文献、索引、版权页也常在结尾
+
+        ``head_ratio`` and ``middle_ratio`` split the budget; the tail gets
+        the rest. A part with a zero share is dropped together with its
+        marker, so ``head_ratio=1`` keeps only the opening of the document.
 
         Args:
             content: 原始内容
@@ -238,23 +290,29 @@ class ContentTruncator:
         """
         if len(content) <= max_chars:
             return content
+        head_ratio = min(max(float(head_ratio), 0.0), 1.0)
+        middle_ratio = min(max(float(middle_ratio), 0.0), 1.0 - head_ratio)
+        tail_ratio = 1.0 - head_ratio - middle_ratio
+        has_middle = middle_ratio > 0
+        has_tail = tail_ratio > 1e-9
 
-        first_marker = "\n\n[... middle omitted ...]\n\n"
-        second_marker = "\n\n[... omitted ...]\n\n"
-        marker_len = len(first_marker) + len(second_marker)
+        marker_len = (len(ContentTruncator._MIDDLE_MARKER) if has_middle else 0) + (
+            len(ContentTruncator._TAIL_MARKER) if has_tail else 0
+        )
         if max_chars <= marker_len + 3:
             return content[:max_chars]
 
         content_budget = max_chars - marker_len
-        head_len = int(content_budget * 0.6)
-        mid_len = int(content_budget * 0.2)
-        tail_len = content_budget - head_len - mid_len
+        head_len = int(content_budget * head_ratio)
+        mid_len = int(content_budget * middle_ratio) if has_middle else 0
+        tail_len = content_budget - head_len - mid_len if has_tail else 0
 
-        head = content[:head_len]
-
-        mid_start = max((len(content) - mid_len) // 2, 0)
-        mid = content[mid_start : mid_start + mid_len]
-
-        tail = content[-tail_len:]
-
-        return f"{head}{first_marker}{mid}{second_marker}{tail}"
+        parts = [content[:head_len]]
+        if has_middle:
+            mid_start = max((len(content) - mid_len) // 2, 0)
+            parts.append(ContentTruncator._MIDDLE_MARKER)
+            parts.append(content[mid_start : mid_start + mid_len])
+        if has_tail:
+            parts.append(ContentTruncator._TAIL_MARKER)
+            parts.append(content[-tail_len:] if tail_len > 0 else "")
+        return "".join(parts)

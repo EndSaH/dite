@@ -341,8 +341,14 @@ def _extended_sweep_configs(base: Config) -> list[tuple[str, Config, PipelineOpt
                             )
                             runs.append((f"extended-{run_id:03d}", config, options))
                             run_id += 1
-    for input_mode in ("with_filename", "content_only"):
-        for topic in _alternative_topic_clusterings(base):
+    # "summary" embeds title/summary/topic/keywords plus a short excerpt
+    # instead of a raw text cut. It is compared at the default HDBSCAN
+    # settings and against the alternative topic clusterings.
+    alternative_topics = [base.topic_clustering, *_alternative_topic_clusterings(base)]
+    for input_mode in ("with_filename", "content_only", "summary"):
+        for index, topic in enumerate(alternative_topics):
+            if index == 0 and input_mode != "summary":
+                continue  # already covered by the grid above
             config = replace(base, topic_clustering=topic)
             options = PipelineOptions(embedding_input_mode=input_mode)
             runs.append((f"extended-{run_id:03d}", config, options))
