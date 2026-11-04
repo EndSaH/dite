@@ -447,3 +447,79 @@ def test_embedding_cache_key_changes_with_excerpt_settings(tmp_path: Path) -> No
 
     assert "excerpt=" not in default_version
     assert _run(changed).endswith("|excerpt=8000:0.6:0.2")
+
+
+def test_features_are_built_once_per_canonical_document(monkeypatch) -> None:
+    calls: list[str] = []
+    real_build = build_document_features
+
+    def _counting_build(path, content, **kwargs):
+        calls.append(path.name)
+        return real_build(path, content, **kwargs)
+
+    monkeypatch.setattr("dite.cluster.stage.build_document_features", _counting_build)
+    files = [Path("a.md"), Path("copy-of-a.md"), Path("b.md")]
+
+    build_canonical_cluster_stage(
+        files=files,
+        contents=["same", "same", "other"],
+        file_hashes=["h-a", "h-a", "h-b"],
+        file_reports=[None, None, None],
+        canonical_indices=[0, 2],
+        options=PipelineOptions(),
+        config=Config(),
+        client=None,
+        request_runtime=None,
+        vectorize=lambda files_arg, hashes, texts, options: np.eye(
+            len(texts), dtype=np.float32
+        ),
+        expand_noise_repaired_count=lambda *args: 0,
+        cluster_documents_fn=_all_noise_cluster_fn,
+    )
+
+    assert calls == ["a.md", "b.md"]
+
+
+def test_analysis_features_run_concurrently_and_keep_order(monkeypatch) -> None:
+    import threading
+    import time
+
+    from dite.cluster.stage import _build_features_parallel
+
+    active = {"now": 0, "max": 0}
+    lock = threading.Lock()
+    real_build = build_document_features
+
+    def _slow_build(path, content, **kwargs):
+        with lock:
+            active["now"] += 1
+            active["max"] = max(active["max"], active["now"])
+        time.sleep(0.05)
+        with lock:
+            active["now"] -= 1
+        return real_build(path, content)
+
+    monkeypatch.setattr("dite.cluster.stage.build_document_features", _slow_build)
+    config = Config()
+    config.feature_extraction.analysis_enabled = True
+    config.feature_extraction.analysis_workers = 4
+    items = [(Path(f"doc-{index}.md"), f"Body {index}", None) for index in range(8)]
+
+    features = _build_features_parallel(items, config=config, client=object())
+
+    assert [feature.name for feature in features] == [
+        f"doc-{index}.md" for index in range(8)
+    ]
+    assert active["max"] > 1
+
+
+def test_common_filename_tokens_do_not_create_candidate_pairs() -> None:
+    from dite.cluster.link import _filename_overlap_pairs
+
+    # Every name shares "file"; none reaches Jaccard 0.8 with another.
+    token_sets = [{"file", str(index)} for index in range(200)]
+    token_sets.append({"file", "7"})  # a true near-duplicate of file 7
+
+    pairs = _filename_overlap_pairs(token_sets, 0.8)
+
+    assert pairs == {(7, 200)}

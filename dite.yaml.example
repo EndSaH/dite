@@ -50,6 +50,7 @@ processing:
   excerpt_middle_ratio: 0.2            # Share from the middle; the end gets the rest
   vlm_fallback_threshold: 100          # Final-output usability threshold used by pdf-check smoke checks
   docling_pdf_timeout_sec: 60          # Max seconds per Docling PDF extraction
+  docling_pdf_max_pages: 50            # Convert only the first N PDF pages (null = all)
   docling_device: auto                 # auto / cpu / cuda / cuda:N / mps
   extract_workers: 4                   # Max concurrent file extraction workers
   docling_pdf_workers: 1               # Max concurrent Docling PDF subprocesses
@@ -63,6 +64,7 @@ feature_extraction:
   analysis_enabled: false              # Enable analyzer-based feature enrichment
   analysis_max_content_length: 4000    # Prompt truncation length for analyzer input
   analysis_max_retries: 2              # Analyzer retry count
+  analysis_workers: 4                  # Concurrent analyzer requests
 
 # Candidate edge / component generation
 candidate_generation:

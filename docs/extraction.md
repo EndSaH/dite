@@ -65,6 +65,17 @@
 
 这意味着 PDF 回退不是所有文档的通用第二轮处理。
 
+## Docling 的 PDF 页数上限
+
+`processing.docling_pdf_max_pages`（默认 50，设为 `null` 表示不限）让 Docling 只转换 PDF 的前 N 页（通过 `page_range`，不会因为页数多而拒绝文件）。原因：
+
+- 进入后续流程的只是一段摘录（`text_truncate_limit`，默认 4000 字符），转换整本书的绝大部分工作都被丢掉。
+- 上百页的书在 CPU 上常常撞上 `docling_pdf_timeout_sec`，然后整份文档转去走 VLM 采样。
+
+50 页以内的文档完全不受影响。更长的文档，摘录的首/中/尾取自前 N 页，而不是整本书（书末通常是索引和参考文献）。
+
+内容缓存只按文件哈希索引，不记录提取设置：已经缓存过的文件会继续使用当时的提取结果。改了这个值想让旧文件也生效，需要先 `dite cache clear`。DOCX/PPTX 等非分页格式不受影响。
+
 ## PDF 的 VLM 采样上限
 
 当前 PDF 的 VLM 采样深度是固定的：

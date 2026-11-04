@@ -126,6 +126,10 @@ class PipelineService:
         semaphore: threading.BoundedSemaphore,
     ) -> ExtractionResult:
         with semaphore:
+            extra_kwargs = {}
+            max_pages = getattr(extractor, "_pdf_max_pages", None)
+            if max_pages is not None:
+                extra_kwargs["max_pages"] = max_pages
             return extract_docling_pdf_in_subprocess(
                 file_path,
                 enable_ocr=extractor._enable_ocr,
@@ -133,6 +137,7 @@ class PipelineService:
                 timeout_sec=extractor._pdf_timeout_sec,
                 locale=get_locale(),
                 device=extractor._device,
+                **extra_kwargs,
             )
 
     def _extract_primary_result(

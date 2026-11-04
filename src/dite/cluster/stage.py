@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
@@ -430,6 +431,38 @@ def cluster_canonical_documents(
     )
 
 
+def _build_features_parallel(
+    items: list[tuple[Path, str, Any]],
+    *,
+    config: Config,
+    client,
+) -> list[DocumentFeatures]:
+    """Build document features, running LLM analysis calls concurrently.
+
+    Without analysis, features are cheap local computations and run inline.
+    Results keep the input order.
+    """
+
+    def _build(item: tuple[Path, str, Any]) -> DocumentFeatures:
+        file, content, report = item
+        return build_document_features(
+            file,
+            content,
+            config=config,
+            client=client,
+            file_report=report,
+        )
+
+    workers = max(1, int(config.feature_extraction.analysis_workers))
+    analysis_on = config.feature_extraction.analysis_enabled and client is not None
+    if not analysis_on or workers == 1 or len(items) < 2:
+        return [_build(item) for item in items]
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(workers, len(items))
+    ) as executor:
+        return list(executor.map(_build, items))
+
+
 def build_canonical_cluster_stage(
     *,
     files: list[Path],
@@ -446,23 +479,21 @@ def build_canonical_cluster_stage(
     cluster_documents_fn,
 ) -> CanonicalClusterStageResult:
     """Build all V2 stage objects and canonical clustering outputs."""
-    document_features = [
-        build_document_features(
-            file,
-            content,
-            config=config,
-            client=client,
-            file_report=report,
-        )
-        for file, content, report in zip(files, contents, file_reports, strict=True)
-    ]
     cluster_mode = options.cluster_mode or config.topic_clustering.mode
     canonical_files = [files[index] for index in canonical_indices]
     canonical_hashes = [file_hashes[index] for index in canonical_indices]
     canonical_contents = [contents[index] for index in canonical_indices]
-    canonical_document_features = [
-        document_features[index] for index in canonical_indices
-    ]
+    # Duplicates reuse their canonical document's features downstream, so
+    # building features for them was wasted work (and wasted LLM calls when
+    # analysis is enabled).
+    canonical_document_features = _build_features_parallel(
+        [
+            (files[index], contents[index], file_reports[index])
+            for index in canonical_indices
+        ],
+        config=config,
+        client=client,
+    )
     embedding_texts = canonical_contents
     if options.embedding_input_mode == "summary":
         embedding_texts = [

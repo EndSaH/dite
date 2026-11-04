@@ -148,10 +148,12 @@ YAML 中的字符串值支持环境变量展开。
 - `analysis_enabled`
 - `analysis_max_content_length`
 - `analysis_max_retries`
+- `analysis_workers`（默认 4）
 
 当前行为要点：
 
 - 默认关闭。
+- 只为去重后的规范样本做分析（重复文件复用同一份特征），并发数由 `analysis_workers` 控制。分析结果目前不缓存，每次运行都会重新请求。
 - 开启后，`DocumentFeatures` 会尝试使用 analyzer 增强摘要、关键词、主题、领域和布局提示。
 - analyzer 失败不会中止主流程，而是回退到现有轻规则特征。
 
@@ -230,6 +232,7 @@ YAML 中的字符串值支持环境变量展开。
 - `text_truncate_limit`
 - `vlm_fallback_threshold`
 - `docling_pdf_timeout_sec`
+- `docling_pdf_max_pages`
 - `docling_device`
 - `extract_workers`
 - `docling_pdf_workers`
@@ -246,6 +249,7 @@ YAML 中的字符串值支持环境变量展开。
 - `excerpt_head_ratio`（默认 0.6）和 `excerpt_middle_ratio`（默认 0.2）决定长文档摘录怎么分配预算：开头取多少、中段取多少，剩下的给结尾。结尾常常是参考文献、索引或版权页，`0.8 / 0.2`（不要结尾）这类偏重开头的切法值得在验证集上试。比例为 0 的部分连同它的省略标记一起省掉。两者都必须在 0 到 1 之间，且加起来不超过 1。
 - `text_truncate_limit` 或这两个比例不是默认值时，embedding 缓存键会带上 `excerpt=上限:首:中`，改了设置就会重新向量化，不会复用按旧摘录算出的向量。默认设置下缓存键和以前一样，已有缓存继续有效。
 - `vlm_fallback_threshold` 是判断 PDF 提取结果是否过弱的有效长度阈值。
+- `docling_pdf_max_pages`（默认 50，`null` 为不限）只转换 PDF 的前 N 页，详见 `docs/extraction.md`。
 - `extract_workers` 限制规范样本文件的并行提取数。
 - `docling_pdf_workers` 限制 Docling PDF 子进程的并发量。
 - `cluster_naming_workers` 限制簇命名请求并发量。

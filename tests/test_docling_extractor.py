@@ -374,3 +374,111 @@ def test_extract_docling_pdf_in_subprocess_times_out_and_terminates(
     assert result.extractor == "docling"
     assert result.error == "Docling PDF extraction timed out after 0.25s"
     assert "terminate" in lifecycle
+
+
+class _RecordingConverter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def convert(self, source, **kwargs):
+        self.calls.append((source, kwargs))
+
+        class _Document:
+            def export_to_markdown(self) -> str:
+                return "# Title\nBody"
+
+        return type("_Result", (), {"document": _Document()})()
+
+
+def _extract_with_recording_converter(
+    tmp_path: Path, monkeypatch, file_name: str, **extractor_kwargs
+):
+    path = tmp_path / file_name
+    path.write_bytes(b"%PDF-1.7" if file_name.endswith(".pdf") else b"PK")
+    monkeypatch.setattr(
+        "dite.io.docling.has_docling_pdf_artifacts", lambda *args, **kwargs: True
+    )
+    converter = _RecordingConverter()
+    extractor = DoclingExtractor(pdf_timeout_sec=None, **extractor_kwargs)
+    monkeypatch.setattr(extractor, "_get_converter", lambda: converter)
+    result = extractor.extract(path)
+    return result, converter.calls
+
+
+def test_docling_pdf_conversion_is_limited_to_the_first_pages(
+    tmp_path: Path, monkeypatch
+) -> None:
+    result, calls = _extract_with_recording_converter(
+        tmp_path, monkeypatch, "book.pdf", pdf_max_pages=12
+    )
+
+    assert result.success is True
+    # page_range limits conversion; max_num_pages would reject long PDFs.
+    assert calls[0][1] == {"page_range": (1, 12)}
+
+
+def test_docling_page_limit_can_be_disabled_and_skips_non_pdf(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _result, unlimited = _extract_with_recording_converter(
+        tmp_path, monkeypatch, "book.pdf", pdf_max_pages=None
+    )
+    _result, slides = _extract_with_recording_converter(
+        tmp_path, monkeypatch, "deck.pptx", pdf_max_pages=12
+    )
+
+    assert unlimited[0][1] == {}
+    assert slides[0][1] == {}
+
+
+def test_docling_child_process_receives_page_limit(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class _Conn:
+        def send(self, payload) -> None:
+            captured["payload"] = payload
+
+        def close(self) -> None:
+            pass
+
+    class _FakeDoclingExtractor:
+        def __init__(self, **kwargs) -> None:
+            captured["kwargs"] = kwargs
+
+        def extract(self, file_path: Path) -> ExtractionResult:
+            return ExtractionResult(content="ok", success=True, extractor="docling")
+
+    monkeypatch.setattr("dite.io.docling.silence_docling_logging", lambda: None)
+    monkeypatch.setattr("dite.io.docling.DoclingExtractor", _FakeDoclingExtractor)
+
+    _docling_pdf_extract_child(
+        str(tmp_path / "a.pdf"), False, None, "en", "auto", _Conn(), 25
+    )
+
+    assert captured["kwargs"]["pdf_max_pages"] == 25
+
+
+def test_pipeline_passes_page_limit_to_docling_subprocess(monkeypatch) -> None:
+    import threading
+
+    from dite.app.config import Config
+    from dite.flow.api import PipelineService
+
+    captured: dict[str, object] = {}
+
+    def _fake_subprocess(file_path, **kwargs):
+        captured.update(kwargs)
+        return ExtractionResult(content="ok", success=True, extractor="docling")
+
+    monkeypatch.setattr(
+        "dite.flow.api.extract_docling_pdf_in_subprocess", _fake_subprocess
+    )
+    config = Config()
+    service = PipelineService(client=object(), config=config, cache=None)
+    extractor = service._make_extractor_registry().get_docling()
+
+    service._extract_docling_pdf_primary_result(
+        Path("book.pdf"), extractor, threading.BoundedSemaphore(1)
+    )
+
+    assert captured["max_pages"] == config.processing.docling_pdf_max_pages == 50

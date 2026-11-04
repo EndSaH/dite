@@ -55,6 +55,7 @@ class ExtractorRegistry:
             self._docling = DoclingExtractor(
                 pdf_timeout_sec=self.config.processing.docling_pdf_timeout_sec,
                 device=self.config.processing.docling_device,
+                pdf_max_pages=self.config.processing.docling_pdf_max_pages,
             )
         return self._docling
 

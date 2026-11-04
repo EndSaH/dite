@@ -91,6 +91,9 @@ class ProcessingConfig:
     excerpt_middle_ratio: float = 0.2
     vlm_fallback_threshold: int = 100  # 有效内容少于此阈值时触发 VLM 回退
     docling_pdf_timeout_sec: float = 60.0
+    # Convert only the first N pages of a PDF (null = all). Only a short
+    # excerpt reaches clustering, and whole books otherwise hit the timeout.
+    docling_pdf_max_pages: int | None = 50
     docling_device: str = "auto"
     extract_workers: int = field(default_factory=lambda: min(4, os.cpu_count() or 1))
     docling_pdf_workers: int = 1
@@ -109,6 +112,7 @@ class FeatureExtractionConfig:
     analysis_enabled: bool = False
     analysis_max_content_length: int = 4000
     analysis_max_retries: int = 2
+    analysis_workers: int = 4  # concurrent analyzer requests
 
 
 @dataclass

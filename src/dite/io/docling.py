@@ -113,6 +113,7 @@ def _docling_pdf_extract_child(
     locale: str,
     device: str,
     conn: Connection,
+    max_pages: int | None = None,
 ) -> None:
     try:
         set_locale(locale)
@@ -122,6 +123,7 @@ def _docling_pdf_extract_child(
             artifacts_path=Path(artifacts_path) if artifacts_path is not None else None,
             pdf_timeout_sec=None,
             device=device,
+            pdf_max_pages=max_pages,
         )
         conn.send(extractor.extract(Path(file_path)))
     finally:
@@ -136,6 +138,7 @@ def extract_docling_pdf_in_subprocess(
     timeout_sec: float | None = 60.0,
     locale: str,
     device: str = "auto",
+    max_pages: int | None = None,
 ) -> ExtractionResult:
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe(duplex=False)
@@ -148,6 +151,7 @@ def extract_docling_pdf_in_subprocess(
             locale,
             device,
             child_conn,
+            max_pages,
         ),
     )
 
@@ -200,17 +204,23 @@ class DoclingExtractor(BaseExtractor):
         artifacts_path: Path | None = None,
         pdf_timeout_sec: float | None = 60.0,
         device: str = "auto",
+        pdf_max_pages: int | None = None,
     ):
         """
         Args:
             enable_ocr: 是否启用 OCR（默认禁用，因为非常慢）
             device: Docling 推理设备（auto/cpu/cuda/cuda:N/mps）
+            pdf_max_pages: 只转换 PDF 的前 N 页（None 表示全部）。只有一段
+                摘录会进入后续流程，转换整本书既慢又容易超时。
         """
         self._converter = None
         self._enable_ocr = enable_ocr
         self._artifacts_path = artifacts_path or get_docling_pdf_artifacts_path()
         self._pdf_timeout_sec = pdf_timeout_sec
         self._device = device
+        self._pdf_max_pages = (
+            pdf_max_pages if pdf_max_pages is not None and pdf_max_pages > 0 else None
+        )
 
     def _get_converter(self):
         """延迟加载 Docling（避免启动时的开销）"""
@@ -252,8 +262,13 @@ class DoclingExtractor(BaseExtractor):
         try:
             converter = self._get_converter()
             if file_path.suffix.lower() == ".pdf":
+                convert_kwargs = {}
+                if self._pdf_max_pages is not None:
+                    # page_range limits the pages converted; max_num_pages
+                    # would instead reject longer documents outright.
+                    convert_kwargs["page_range"] = (1, self._pdf_max_pages)
                 with _docling_pdf_timeout(self._pdf_timeout_sec):
-                    result = converter.convert(str(file_path))
+                    result = converter.convert(str(file_path), **convert_kwargs)
             else:
                 result = converter.convert(str(file_path))
             content = result.document.export_to_markdown()
