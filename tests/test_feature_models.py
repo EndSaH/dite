@@ -284,6 +284,44 @@ def test_build_adjudication_requests_and_rule_decisions() -> None:
     assert all(isinstance(item, AdjudicationDecision) for item in decisions)
 
 
+def test_adjudication_thresholds_are_configurable() -> None:
+    edges = [
+        CandidateEdge(
+            source_id="doc-a",
+            target_id="doc-b",
+            edge_type="content_similarity",
+            score=0.93,
+            evidence=["content_similarity:0.930"],
+        ),
+        CandidateEdge(
+            source_id="doc-c",
+            target_id="doc-d",
+            edge_type="content_similarity",
+            score=0.88,
+            evidence=["content_similarity:0.880"],
+        ),
+    ]
+
+    strict_requests = build_adjudication_requests(edges, [], score_threshold=0.9)
+    assert [request.subjects for request in strict_requests] == [["doc-a", "doc-b"]]
+
+    default_requests = build_adjudication_requests(edges, [])
+    assert len(default_requests) == 2
+
+    strict_decisions = apply_rule_adjudication(
+        default_requests, edge_merge_threshold=0.95
+    )
+    assert [decision.decision for decision in strict_decisions] == [
+        "review_edge",
+        "review_edge",
+    ]
+    default_decisions = apply_rule_adjudication(default_requests)
+    assert [decision.decision for decision in default_decisions] == [
+        "merge_edge",
+        "review_edge",
+    ]
+
+
 def test_apply_llm_adjudication_can_override_review_edges() -> None:
     requests = [
         AdjudicationRequest(

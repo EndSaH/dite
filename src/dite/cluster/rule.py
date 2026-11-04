@@ -16,12 +16,20 @@ from dite.cluster.model import (
 from dite.util.api import ChatCompletionRequest
 from dite.util.llm import build_chat_completion_kwargs
 
+DEFAULT_REQUEST_SCORE_THRESHOLD = 0.85
+DEFAULT_EDGE_MERGE_THRESHOLD = 0.92
+
 
 def build_adjudication_requests(
     candidate_edges: list[CandidateEdge],
     candidate_components: list[CandidateComponent],
+    *,
+    score_threshold: float = DEFAULT_REQUEST_SCORE_THRESHOLD,
 ) -> list[AdjudicationRequest]:
-    """Build minimal adjudication requests from currently ambiguous edge cases."""
+    """Build minimal adjudication requests from currently ambiguous edge cases.
+
+    Only edges whose score reaches ``score_threshold`` become edge reviews.
+    """
     requests: list[AdjudicationRequest] = []
     for component in candidate_components:
         if len(component.member_file_ids) < 2:
@@ -36,7 +44,7 @@ def build_adjudication_requests(
             )
         )
     for edge in candidate_edges:
-        if edge.score < 0.85:
+        if edge.score < score_threshold:
             continue
         requests.append(
             AdjudicationRequest(
@@ -54,8 +62,14 @@ def build_adjudication_requests(
 
 def apply_rule_adjudication(
     requests: list[AdjudicationRequest],
+    *,
+    edge_merge_threshold: float = DEFAULT_EDGE_MERGE_THRESHOLD,
 ) -> list[AdjudicationDecision]:
-    """Apply conservative rule-only adjudication to current requests."""
+    """Apply conservative rule-only adjudication to current requests.
+
+    Edge reviews scoring at least ``edge_merge_threshold`` are promoted to
+    ``merge_edge``; everything else stays a review-only decision.
+    """
     decisions: list[AdjudicationDecision] = []
     for request in requests:
         if request.request_type == "component_review":
@@ -75,7 +89,7 @@ def apply_rule_adjudication(
         if (
             request.request_type == "edge_review"
             and request.score is not None
-            and request.score >= 0.92
+            and request.score >= edge_merge_threshold
             and "filename_dominant" not in request.quality_guard
         ):
             decisions.append(
