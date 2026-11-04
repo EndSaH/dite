@@ -1,9 +1,12 @@
 """CLI smoke tests for Phase 0 baseline stability."""
 
 import logging
+import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
+import pytest
 from typer.testing import CliRunner
 
 from dite.app.cli import app
@@ -516,6 +519,57 @@ def test_organize_preview_sanitizes_cluster_name(tmp_path: Path) -> None:
     preview.add_cluster("finance/reports:*", [tmp_path / "a.pdf"])
 
     assert "finance-reports-" in preview.cluster_map
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_organize_script_does_not_execute_hostile_names(tmp_path: Path) -> None:
+    source_folder = tmp_path / "src"
+    target_folder = tmp_path / "out"
+    source_folder.mkdir()
+    marker_dir = tmp_path / "markers"
+    marker_dir.mkdir()
+
+    # The script runs inside marker_dir, so any injected `touch` lands there.
+    hostile_names = [
+        "report$(touch subst).pdf",
+        "notes`touch backtick`.md",
+        'quote"; touch dquote; echo ".txt',
+        "it's single.txt",
+        "-leading-dash.txt",
+        "line\ntouch newline\n.txt",
+        "tab\there.txt",
+    ]
+    files = []
+    for index, name in enumerate(hostile_names):
+        path = source_folder / name
+        path.write_text(f"payload {index}", encoding="utf-8")
+        files.append(path)
+
+    preview = OrganizePreview(source_folder=source_folder, target_folder=target_folder)
+    # The cluster name comes from an LLM that read document content.
+    preview.add_cluster("Finance `touch cluster` $(touch cluster2)", files)
+    script_path = tmp_path / "organize.sh"
+    preview.generate_script(script_path)
+
+    # Uncomment the delete section too, as a user following the script would.
+    script = script_path.read_text(encoding="utf-8")
+    script = script.replace("\n# rm -- ", "\nrm -- ")
+    script_path.write_text(script, encoding="utf-8")
+
+    completed = subprocess.run(
+        ["bash", str(script_path)],
+        cwd=marker_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert list(marker_dir.iterdir()) == []
+    for index, op in enumerate(preview.operations):
+        assert op.source == files[index]
+        assert op.destination.read_text(encoding="utf-8") == f"payload {index}"
+        assert not op.source.exists()
 
 
 def test_organize_preview_avoids_destination_overwrite(tmp_path: Path) -> None:

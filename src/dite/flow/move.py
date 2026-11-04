@@ -1,5 +1,6 @@
 """文件整理模块"""
 
+import shlex
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -11,6 +12,37 @@ from rich.panel import Panel
 from rich.table import Table
 
 from dite.app.i18n import t
+
+_ANSI_C_ESCAPES = {
+    "\\": "\\\\",
+    "'": "\\'",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
+
+
+def shell_quote(value: str | Path) -> str:
+    """Quote one word for bash so it is never expanded or split.
+
+    Paths and cluster names come from the scanned folder and from LLM output,
+    so they must be treated as hostile: inside double quotes bash would still
+    run ``$(...)`` and backticks. Plain values use POSIX single quotes. Values
+    with control characters use bash ANSI-C quoting (``$'...'``) so a newline
+    in a file name cannot end a line, including a comment line.
+    """
+    text = str(value)
+    if not any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return shlex.quote(text)
+    escaped = []
+    for ch in text:
+        if ch in _ANSI_C_ESCAPES:
+            escaped.append(_ANSI_C_ESCAPES[ch])
+        elif ord(ch) < 32 or ord(ch) == 127:
+            escaped.append(f"\\x{ord(ch):02x}")
+        else:
+            escaped.append(ch)
+    return "$'" + "".join(escaped) + "'"
 
 
 @dataclass
@@ -146,11 +178,13 @@ class OrganizePreview:
         """
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+        # Every path and name below is quoted with shell_quote(): file names
+        # and LLM-generated cluster names must never be parsed as shell code.
         lines = [
             "#!/bin/bash",
             f"# {t('organize_script_header')} - {timestamp}",
-            f"# Source: {self.source_folder}",
-            f"# Target: {self.target_folder}",
+            f"# Source: {shell_quote(self.source_folder)}",
+            f"# Target: {shell_quote(self.target_folder)}",
             "#",
             f"# {t('organize_script_usage')}",
             "#   1. Review this script",
@@ -165,25 +199,28 @@ class OrganizePreview:
         # 创建目录命令
         for cluster_name in self.cluster_map:
             dest_dir = self.target_folder / cluster_name
-            lines.append(f'mkdir -p "{dest_dir}"')
+            lines.append(f"mkdir -p -- {shell_quote(dest_dir)}")
 
         lines.append("")
         lines.append(f"# {t('organize_script_copy_files')}")
 
         # 复制命令
         for op in self.operations:
-            lines.append(f'cp -p "{op.source}" "{op.destination}"')
+            lines.append(
+                f"cp -p -- {shell_quote(op.source)} {shell_quote(op.destination)}"
+            )
 
         lines.append("")
         lines.append(f"# {t('organize_script_verify')}")
         lines.append("# (Uncomment the following lines to delete original files)")
 
         for op in self.operations:
-            lines.append(f'# rm "{op.source}"')
+            lines.append(f"# rm -- {shell_quote(op.source)}")
 
         lines.append("")
-        lines.append(f'echo "{t("organize_script_done", count=len(self.operations))}"')
-        lines.append(f'echo "{t("organize_script_warning")}"')
+        done_message = t("organize_script_done", count=len(self.operations))
+        lines.append(f"echo {shell_quote(done_message)}")
+        lines.append(f"echo {shell_quote(t('organize_script_warning'))}")
 
         output_path.write_text("\n".join(lines), encoding="utf-8")
 

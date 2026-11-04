@@ -1,4 +1,5 @@
 import json
+import shlex
 import shutil
 from pathlib import Path
 
@@ -562,9 +563,15 @@ def test_organize_cli_script_moves_duplicate_aliases_to_same_cluster(
     assert result.exit_code == 0
     script = script_path.read_text(encoding="utf-8")
     cluster_dir = docs / "organized" / "Duplicate Papers"
-    assert f'mkdir -p "{cluster_dir}"' in script
-    assert f'cp -p "{first}" "{cluster_dir / first.name}"' in script
-    assert f'cp -p "{second}" "{cluster_dir / second.name}"' in script
+    assert f"mkdir -p -- {shlex.quote(str(cluster_dir))}" in script
+    assert (
+        f"cp -p -- {shlex.quote(str(first))} "
+        f"{shlex.quote(str(cluster_dir / first.name))}"
+    ) in script
+    assert (
+        f"cp -p -- {shlex.quote(str(second))} "
+        f"{shlex.quote(str(cluster_dir / second.name))}"
+    ) in script
 
 
 def test_organize_cli_output_script_generates_shell_script(
@@ -601,8 +608,8 @@ def test_organize_cli_output_script_generates_shell_script(
     assert result.exit_code == 0
     assert script_path.exists()
     script = script_path.read_text(encoding="utf-8")
-    assert 'mkdir -p "' in script
-    assert 'cp -p "' in script
+    assert "mkdir -p -- " in script
+    assert "cp -p -- " in script
     assert str(source) in script
     assert source.exists()
 
