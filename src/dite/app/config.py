@@ -92,6 +92,9 @@ class ProcessingConfig:
     cluster_naming_workers: int = 2
     vlm_api_workers: int = 8
     vlm_pages_per_document: int = 4
+    # Inputs per embeddings request. Rejected batches are halved automatically,
+    # so this is an upper bound, not something every provider must accept.
+    embedding_batch_size: int = 32
 
 
 @dataclass

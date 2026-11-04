@@ -3,7 +3,7 @@
 from typing import Literal
 
 import numpy as np
-from openai import OpenAI
+from openai import APIStatusError, OpenAI
 
 from dite.app.config import Config
 from dite.app.i18n import t
@@ -96,6 +96,8 @@ def get_embeddings(
     """
     logger = get_logger()
     model = embedding_model or config.models.embedding
+    if not texts:
+        return np.zeros((0, 0), dtype=np.float32)
 
     logger.debug(t("debug_vectorizing_documents", count=len(texts)))
     logger.debug(t("debug_vectorizing_model", model=model))
@@ -135,18 +137,76 @@ def get_embeddings(
         )
     )
 
-    response = client.embeddings.create(
-        model=model,
-        input=valid_texts,
-    )
+    batch_size = max(1, int(config.processing.embedding_batch_size))
+    embeddings: list[list[float]] = []
+    total_tokens = 0
+    for start in range(0, len(valid_texts), batch_size):
+        batch_embeddings, batch_tokens = _embed_batch(
+            client,
+            model,
+            valid_texts[start : start + batch_size],
+        )
+        embeddings.extend(batch_embeddings)
+        total_tokens += batch_tokens
 
-    embeddings = [item.embedding for item in response.data]
     result = normalize_embeddings(np.array(embeddings))
 
     logger.debug(t("debug_vector_dimension", dimension=result.shape[1]))
-    logger.debug(t("debug_vector_api_usage", tokens=response.usage.total_tokens))
+    logger.debug(t("debug_vector_api_usage", tokens=total_tokens))
 
     return result
+
+
+def _is_request_too_large(exc: APIStatusError) -> bool:
+    """Return whether a provider rejection may be about the batch size.
+
+    Providers cap inputs per request differently (some at 10, OpenAI at
+    2048) and report it as 400 or 413. Transient errors (429, 5xx) are
+    already retried by the SDK and are not split.
+    """
+    return getattr(exc, "status_code", None) in {400, 413}
+
+
+def _embed_batch(
+    client: OpenAI,
+    model: str,
+    inputs: list[str],
+) -> tuple[list[list[float]], int]:
+    """Embed one batch, halving it when the provider rejects its size.
+
+    When a batch is rejected, its first half is retried first. If even a
+    single input is rejected, the error is not about size and is raised, so a
+    bad model name costs about log2(batch) requests, not one per input.
+    """
+    try:
+        response = client.embeddings.create(model=model, input=inputs)
+    except APIStatusError as exc:
+        if len(inputs) <= 1 or not _is_request_too_large(exc):
+            raise
+        middle = len(inputs) // 2
+        get_logger().debug(
+            t(
+                "debug_vector_batch_split",
+                size=len(inputs),
+                status=getattr(exc, "status_code", "-"),
+            )
+        )
+        left, left_tokens = _embed_batch(client, model, inputs[:middle])
+        right, right_tokens = _embed_batch(client, model, inputs[middle:])
+        return left + right, left_tokens + right_tokens
+
+    items = list(response.data)
+    if len(items) != len(inputs):
+        raise ValueError(
+            "embedding response size mismatch: "
+            f"sent {len(inputs)} inputs, received {len(items)} vectors"
+        )
+    # The API returns an `index` per item; order by it so vectors can never
+    # be attached to the wrong file. Stable sort keeps order if it is absent.
+    items.sort(key=lambda item: getattr(item, "index", 0) or 0)
+    usage = getattr(response, "usage", None)
+    tokens = int(getattr(usage, "total_tokens", 0) or 0)
+    return [item.embedding for item in items], tokens
 
 
 class ContentTruncator:

@@ -236,6 +236,7 @@ class Messages:
     debug_vector_text_stats: str
     debug_vector_dimension: str
     debug_vector_api_usage: str
+    debug_vector_batch_split: str
     debug_cluster_hdbscan_header: str
     debug_cluster_hdbscan_min_cluster_size: str
     debug_cluster_hdbscan_min_samples: str
@@ -543,6 +544,9 @@ ZH_CN = Messages(
     ),
     debug_vector_dimension="  向量维度: {dimension}",
     debug_vector_api_usage="  API 用量: {tokens} tokens",
+    debug_vector_batch_split=(
+        "  embedding 批次被拒绝（status={status}），将 {size} 条拆成两半重试"
+    ),
     debug_cluster_hdbscan_header="HDBSCAN 聚类参数:",
     debug_cluster_hdbscan_min_cluster_size="  min_cluster_size: {value}",
     debug_cluster_hdbscan_min_samples="  min_samples: {value}",
@@ -919,6 +923,10 @@ EN = Messages(
     ),
     debug_vector_dimension="  Vector dimension: {dimension}",
     debug_vector_api_usage="  API usage: {tokens} tokens",
+    debug_vector_batch_split=(
+        "  Embedding batch rejected (status={status}); "
+        "splitting {size} inputs in half"
+    ),
     debug_cluster_hdbscan_header="HDBSCAN parameters:",
     debug_cluster_hdbscan_min_cluster_size="  min_cluster_size: {value}",
     debug_cluster_hdbscan_min_samples="  min_samples: {value}",

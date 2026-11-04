@@ -54,6 +54,7 @@ processing:
   cluster_naming_workers: 2            # Max concurrent cluster naming requests
   vlm_api_workers: 8                   # Max concurrent VLM requests across files/pages
   vlm_pages_per_document: 4            # Max concurrent VLM page requests within one PDF
+  embedding_batch_size: 32             # Max inputs per embeddings request (auto-halved if rejected)
 
 # Optional feature enrichment for clustering V2
 feature_extraction:

@@ -223,6 +223,7 @@ YAML 中的字符串值支持环境变量展开。
 - `cluster_naming_workers`
 - `vlm_api_workers`
 - `vlm_pages_per_document`
+- `embedding_batch_size`
 
 当前行为要点：
 
@@ -233,6 +234,7 @@ YAML 中的字符串值支持环境变量展开。
 - `cluster_naming_workers` 限制簇命名请求并发量。
 - `vlm_api_workers` 限制全局 VLM 请求并发量。
 - `vlm_pages_per_document` 限制单个 PDF 内部的页级并发量，而不是总采样页数。
+- `embedding_batch_size`（默认 32）是每个 embeddings 请求最多携带的文本数。服务商如果因为批次太大返回 400/413，这一批会自动对半拆开重试，所以它是上限，不要求服务商一定接受这么多条。429 和 5xx 由 SDK 按 `api.max_retries` 重试。
 
 需要特别区分的一点：
 
