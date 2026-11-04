@@ -131,10 +131,157 @@ def test_build_document_features_uses_file_report_and_generates_tokens() -> None
     assert features.extraction_trace == "docling->vlm_api"
     assert features.quality_flags.extraction_failed is True
     assert features.quality_flags.short_text is True
-    assert features.quality_flags.filename_dominant is True
+    # The primary parse failed, but VLM fallback produced real text, so the
+    # document's embedding is content-based rather than filename-based.
+    assert features.quality_flags.filename_dominant is False
     assert features.summary == "Quarterly Report"
     assert "revenue" in features.keywords
     assert "quarterly" in features.topic
+
+
+def test_build_document_features_marks_filename_only_text_as_filename_dominant() -> None:
+    features = build_document_features(Path("scans/scan.pdf"), "  p.1  ")
+
+    assert features.quality_flags.filename_dominant is True
+    assert features.quality_flags.extraction_failed is True
+
+
+def test_title_candidates_skip_placeholders_and_generic_headings() -> None:
+    features = build_document_features(
+        Path("course/linear_algebra_ch2.pptx"),
+        "<!-- image -->\n\n目录\n\n## 1. Introduction\n\n"
+        "## Eigenvalues and eigenvectors\nLet A be a square matrix.\n"
+        "<!-- image -->\n<!-- image -->\n",
+    )
+
+    assert features.title_candidates == [
+        "Eigenvalues and eigenvectors",
+        "linear algebra ch2",
+    ]
+    assert "image" not in features.keywords
+
+
+def test_title_candidates_fall_back_to_file_stem_when_content_has_no_title() -> None:
+    features = build_document_features(
+        Path("notes/lecture-01.md"),
+        "<!-- image -->\n\nChapter 1\n\n---\n",
+    )
+
+    assert features.title_candidates == ["lecture 01"]
+
+
+def test_shared_placeholder_titles_and_file_stems_do_not_force_merges() -> None:
+    rng = np.random.default_rng(0)
+    contents = {
+        "finance/q3_invoice.pdf": (
+            "<!-- image -->\n\nInvoice No. 2026-031, total due 4,200 USD."
+        ),
+        "course/linear_algebra_ch2.pptx": (
+            "<!-- image -->\n\n## Eigenvalues and eigenvectors\nLet A be a matrix."
+        ),
+        "courseA/lecture1.pdf": "Operating systems: processes and scheduling.",
+        "courseB/lecture1.pdf": "Organic chemistry: alkanes and alkenes.",
+    }
+    features = []
+    for path, content in contents.items():
+        feature = build_document_features(Path(path), content)
+        feature.content_embedding = rng.normal(size=16).astype(np.float32)
+        features.append(feature)
+
+    edges = build_candidate_edges(features)
+    components = build_candidate_components(features, edges)
+    requests = build_adjudication_requests(edges, components)
+    decisions = apply_rule_adjudication(requests)
+
+    assert [edge.edge_type for edge in edges] == ["filename_similarity"]
+    assert {edges[0].source_id, edges[0].target_id} == {
+        "courseA/lecture1.pdf",
+        "courseB/lecture1.pdf",
+    }
+    assert all(decision.decision != "merge_edge" for decision in decisions)
+
+
+def test_title_match_edges_are_review_only_without_content_similarity() -> None:
+    requests = build_adjudication_requests(
+        [
+            CandidateEdge(
+                source_id="doc-a",
+                target_id="doc-b",
+                edge_type="title_match",
+                score=1.0,
+                evidence=["title_match:quarterly report"],
+            ),
+            CandidateEdge(
+                source_id="doc-c",
+                target_id="doc-d",
+                edge_type="filename_similarity",
+                score=1.0,
+                evidence=["filename_token_overlap:['lecture1']"],
+            ),
+        ],
+        [],
+    )
+
+    decisions = apply_rule_adjudication(requests)
+
+    assert [decision.decision for decision in decisions] == [
+        "review_edge",
+        "review_edge",
+    ]
+
+
+def test_content_similarity_edge_keeps_title_evidence() -> None:
+    left = DocumentFeatures(
+        file_id="doc-a",
+        path=Path("a/report.md"),
+        name="report.md",
+        stem="report",
+        extension=".md",
+        content_text="Quarterly Report\nRevenue grew.",
+        metadata=MetadataFeatures(title_candidates=["Quarterly Report"]),
+        content_embedding=np.array([1.0, 0.0], dtype=np.float32),
+    )
+    right = DocumentFeatures(
+        file_id="doc-b",
+        path=Path("b/summary.md"),
+        name="summary.md",
+        stem="summary",
+        extension=".md",
+        content_text="Quarterly Report\nRevenue fell.",
+        metadata=MetadataFeatures(title_candidates=["Quarterly Report"]),
+        content_embedding=np.array([0.99, 0.05], dtype=np.float32),
+    )
+
+    edges = build_candidate_edges([left, right])
+
+    assert len(edges) == 1
+    assert edges[0].edge_type == "content_similarity"
+    assert "title_match:quarterly report" in edges[0].evidence
+
+
+def test_filename_only_embeddings_do_not_create_content_edges() -> None:
+    left = DocumentFeatures(
+        file_id="a/scan.pdf",
+        path=Path("a/scan.pdf"),
+        name="scan.pdf",
+        stem="scan",
+        extension=".pdf",
+        quality_flags=QualityFlags(filename_dominant=True),
+        content_embedding=np.array([1.0, 0.0], dtype=np.float32),
+    )
+    right = DocumentFeatures(
+        file_id="b/scan.pdf",
+        path=Path("b/scan.pdf"),
+        name="scan.pdf",
+        stem="scan",
+        extension=".pdf",
+        quality_flags=QualityFlags(filename_dominant=True),
+        content_embedding=np.array([1.0, 0.0], dtype=np.float32),
+    )
+
+    edges = build_candidate_edges([left, right])
+
+    assert edges == []
 
 
 def test_candidate_edge_and_component_models_keep_evidence() -> None:

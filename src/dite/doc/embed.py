@@ -10,6 +10,9 @@ from dite.app.i18n import t
 from dite.util.log import get_logger
 
 EmbeddingInputMode = Literal["with_filename", "content_only"]
+# Texts at or below this length are embedded from the file name alone in
+# ``with_filename`` mode, so their vectors carry filename evidence only.
+FILENAME_FALLBACK_MAX_CHARS = 10
 _EMBEDDING_INPUT_VERSIONS: dict[EmbeddingInputMode, str] = {
     "with_filename": "filename-smart-content-normalized-v2",
     "content_only": "content-only-normalized-v1",
@@ -58,7 +61,7 @@ def _build_embedding_input(
     """Build the actual embedding input and optional filename-fallback marker."""
     stripped = text.strip() if text else ""
     if input_mode == "with_filename":
-        if len(stripped) > 10:
+        if len(stripped) > FILENAME_FALLBACK_MAX_CHARS:
             if file_name:
                 return f"File name: {file_name}\n\nContent:\n{stripped}", None
             return stripped, None

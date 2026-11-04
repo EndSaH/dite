@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+# Edge types whose evidence comes from document content. Title and filename
+# edges are metadata hints: they are reported and can inform an LLM reviewer,
+# but rules never merge or link documents on metadata alone.
+CONTENT_BACKED_EDGE_TYPES = frozenset({"near_duplicate", "content_similarity"})
+
 
 @dataclass
 class CandidateEdge:

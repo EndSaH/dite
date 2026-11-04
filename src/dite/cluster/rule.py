@@ -8,6 +8,7 @@ from openai import OpenAI
 
 from dite.app.config import Config
 from dite.cluster.model import (
+    CONTENT_BACKED_EDGE_TYPES,
     AdjudicationDecision,
     AdjudicationRequest,
     CandidateComponent,
@@ -67,8 +68,9 @@ def apply_rule_adjudication(
 ) -> list[AdjudicationDecision]:
     """Apply conservative rule-only adjudication to current requests.
 
-    Edge reviews scoring at least ``edge_merge_threshold`` are promoted to
-    ``merge_edge``; everything else stays a review-only decision.
+    Content-backed edge reviews scoring at least ``edge_merge_threshold`` are
+    promoted to ``merge_edge``. Title and filename edges always stay
+    review-only: a shared first line or file name is a hint, not proof.
     """
     decisions: list[AdjudicationDecision] = []
     for request in requests:
@@ -88,6 +90,7 @@ def apply_rule_adjudication(
             continue
         if (
             request.request_type == "edge_review"
+            and request.trigger_reason in CONTENT_BACKED_EDGE_TYPES
             and request.score is not None
             and request.score >= edge_merge_threshold
             and "filename_dominant" not in request.quality_guard

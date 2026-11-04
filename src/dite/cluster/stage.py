@@ -18,6 +18,7 @@ from dite.cluster import (
 )
 from dite.cluster.link import build_candidate_components, build_candidate_edges
 from dite.cluster.model import (
+    CONTENT_BACKED_EDGE_TYPES,
     AdjudicationDecision,
     AdjudicationRequest,
     CandidateComponent,
@@ -230,6 +231,9 @@ def cluster_canonical_documents(
         min_edge_score = 0.9
         for edge in candidate_edges:
             if edge.score < min_edge_score:
+                continue
+            if edge.edge_type not in CONTENT_BACKED_EDGE_TYPES:
+                # Title/filename matches alone must not form graph clusters.
                 continue
             if (
                 edge.source_id not in file_id_to_index

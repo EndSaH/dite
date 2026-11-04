@@ -9,6 +9,7 @@ from openai import OpenAI
 
 from dite.app.config import Config
 from dite.doc.analyze import analyze_document
+from dite.doc.embed import FILENAME_FALLBACK_MAX_CHARS
 from dite.doc.model import (
     DocumentFeatures,
     EntityFeatures,
@@ -41,20 +42,139 @@ _STOPWORDS = {
 }
 
 
+_TITLE_SCAN_LINE_LIMIT = 15
+_TITLE_MAX_LENGTH = 120
+_CJK_PATTERN = re.compile(r"[一-鿿]")
+_HTML_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
+_HTML_TAG_PATTERN = re.compile(r"</?[A-Za-z][^>]*>")
+_MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_LEADING_NUMBERING_PATTERN = re.compile(
+    r"^(?:[0-9]+(?:\.[0-9]+)*[.、)]?|[ivxIVX]+[.、)]|[一二三四五六七八九十]+[、.])\s+"
+)
+# Lines that look like a title but carry no topic: document furniture,
+# extractor placeholders and bare numbering. Matching one of these across two
+# files says nothing about whether the files belong together.
+_GENERIC_TITLES = {
+    "abstract",
+    "acknowledgements",
+    "acknowledgments",
+    "agenda",
+    "appendix",
+    "bibliography",
+    "chapter",
+    "content",
+    "contents",
+    "cover",
+    "draft",
+    "figure",
+    "foreword",
+    "image",
+    "index",
+    "introduction",
+    "notes",
+    "outline",
+    "overview",
+    "preface",
+    "readme",
+    "references",
+    "slide",
+    "summary",
+    "table of contents",
+    "title",
+    "toc",
+    "unknown",
+    "untitled",
+    "目录",
+    "摘要",
+    "前言",
+    "序言",
+    "引言",
+    "简介",
+    "概述",
+    "附录",
+    "参考文献",
+    "致谢",
+    "封面",
+    "大纲",
+    "笔记",
+    "无标题",
+}
+_GENERIC_TITLE_PATTERNS = (
+    re.compile(
+        r"(?:page|slide|chapter|lecture|lesson|part|section|unit|week|lab|"
+        r"homework|hw|exercise|figure|fig|table)\s*[0-9ivx]+"
+    ),
+    re.compile(r"第\s*[0-9一二三四五六七八九十百零]+\s*[页章节讲课部分周篇]"),
+    re.compile(r"[0-9\W_]+"),
+)
+
+
 def _tokenize_text(text: str) -> list[str]:
     """Return normalized coarse tokens from a file name or path fragment."""
     return [token.casefold() for token in _TOKEN_PATTERN.findall(text)]
 
 
+def strip_markup(text: str) -> str:
+    """Remove extractor placeholders and markup that carry no document topic.
+
+    Docling emits ``<!-- image -->`` for every picture; leaving it in place lets
+    unrelated image-led files share a "title" and a top keyword.
+    """
+    cleaned = _HTML_COMMENT_PATTERN.sub(" ", text)
+    cleaned = _MARKDOWN_IMAGE_PATTERN.sub(" ", cleaned)
+    return _HTML_TAG_PATTERN.sub(" ", cleaned)
+
+
+def filename_title(stem: str) -> str:
+    """Return the title-like form of a file stem (``a_b-c`` -> ``a b c``)."""
+    return re.sub(r"[_-]+", " ", stem).strip()
+
+
+def normalize_title_candidate(line: str) -> str:
+    """Normalize one extracted line into a comparable title string."""
+    cleaned = strip_markup(line).strip()
+    cleaned = cleaned.lstrip("#*>-+| \t").rstrip("|* \t")
+    cleaned = cleaned.strip("\"'`")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def is_generic_title(title: str) -> bool:
+    """Return whether a title is document furniture rather than a topic."""
+    lowered = title.casefold().strip(" .:：-—_")
+    lowered = _LEADING_NUMBERING_PATTERN.sub("", lowered).strip(" .:：-—_")
+    if not lowered or lowered in _GENERIC_TITLES:
+        return True
+    return any(pattern.fullmatch(lowered) for pattern in _GENERIC_TITLE_PATTERNS)
+
+
+def _is_usable_title(title: str) -> bool:
+    min_length = 3 if _CJK_PATTERN.search(title) else 4
+    if not min_length <= len(title) <= _TITLE_MAX_LENGTH:
+        return False
+    if title.startswith(("![", "<", "|")):
+        return False
+    return not is_generic_title(title)
+
+
 def _title_candidates(file_path: Path, content: str) -> list[str]:
-    """Build conservative title candidates from extracted content and file name."""
+    """Build conservative title candidates from extracted content and file name.
+
+    Content-derived titles come first. The file-stem title is appended last as a
+    display fallback; candidate-edge building does not treat it as a title.
+    """
     titles: list[str] = []
+    scanned = 0
     for line in content.splitlines():
-        stripped = re.sub(r"\s+", " ", line.strip())
-        if 4 <= len(stripped) <= 120:
-            titles.append(stripped)
+        if not line.strip():
+            continue
+        scanned += 1
+        if scanned > _TITLE_SCAN_LINE_LIMIT:
             break
-    stem_title = re.sub(r"[_-]+", " ", file_path.stem).strip()
+        candidate = normalize_title_candidate(line)
+        if _is_usable_title(candidate):
+            titles.append(candidate)
+            break
+    stem_title = filename_title(file_path.stem)
     if stem_title and stem_title not in titles:
         titles.append(stem_title)
     return titles
@@ -65,7 +185,11 @@ def _infer_keywords_and_topic(
     title_candidates: list[str],
 ) -> tuple[list[str], str]:
     """Infer lightweight keywords/topic without invoking a model."""
-    tokens = [token for token in _tokenize_text(content) if token not in _STOPWORDS]
+    tokens = [
+        token
+        for token in _tokenize_text(strip_markup(content))
+        if token not in _STOPWORDS
+    ]
     counts: dict[str, int] = {}
     for token in tokens:
         counts[token] = counts.get(token, 0) + 1
@@ -123,9 +247,12 @@ def build_document_features(
             (not primary_success) or len(stripped) < _FAILED_TEXT_THRESHOLD
         ),
         short_text=len(stripped) < _SHORT_TEXT_THRESHOLD,
+        # Judged on the final text, not the primary extractor: a PDF rescued by
+        # VLM fallback has real content even though the primary parse failed.
+        # The cut-off mirrors the embedding input rule, so this flag is true
+        # exactly when the document's vector was built from its file name.
         filename_dominant=(
-            ((not primary_success) or len(stripped) < _FAILED_TEXT_THRESHOLD)
-            and bool(file_path.stem)
+            len(stripped) <= FILENAME_FALLBACK_MAX_CHARS and bool(file_path.stem)
         ),
     )
     title_candidates = _title_candidates(file_path, content)

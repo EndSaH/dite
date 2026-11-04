@@ -8,6 +8,24 @@ import numpy as np
 
 from dite.cluster.model import CandidateComponent, CandidateEdge
 from dite.doc import DocumentFeatures
+from dite.doc.build import filename_title, is_generic_title
+
+
+def _content_title_keys(feature: DocumentFeatures) -> set[str]:
+    """Return comparable content-derived titles for one document.
+
+    The file-stem fallback title is excluded: two ``lecture1.pdf`` files from
+    different courses share a stem, not a title. Filename overlap is scored
+    separately as ``filename_similarity``.
+    """
+    stem_key = filename_title(feature.stem).casefold()
+    keys: set[str] = set()
+    for title in feature.title_candidates:
+        key = title.casefold().strip()
+        if not key or key == stem_key or is_generic_title(key):
+            continue
+        keys.add(key)
+    return keys
 
 
 def _jaccard(left: set[str], right: set[str]) -> float:
@@ -40,41 +58,59 @@ def build_candidate_edges(
     min_filename_token_overlap: float = 0.8,
     min_content_similarity: float = 0.92,
 ) -> list[CandidateEdge]:
-    """Build a conservative first-pass candidate edge set."""
+    """Build a conservative first-pass candidate edge set.
+
+    Edge types are checked in order of evidence strength: identical content,
+    content-embedding similarity, shared content title, filename overlap. Only
+    the first two are content-backed (see ``CONTENT_BACKED_EDGE_TYPES``); title
+    and filename edges are kept as evidence but never force a merge on their
+    own.
+    """
     edges: list[CandidateEdge] = []
+    token_sets = [set(feature.file_name_tokens) for feature in document_features]
+    title_sets = [_content_title_keys(feature) for feature in document_features]
+    stripped_contents = [feature.content_text.strip() for feature in document_features]
 
     for index, left in enumerate(document_features):
-        left_tokens = set(left.file_name_tokens)
-        left_titles = {title.casefold() for title in left.title_candidates}
+        left_tokens = token_sets[index]
+        left_titles = title_sets[index]
+        left_content = stripped_contents[index]
 
-        for right in document_features[index + 1 :]:
-            right_tokens = set(right.file_name_tokens)
-            right_titles = {title.casefold() for title in right.title_candidates}
-            shared_titles = left_titles & right_titles
+        for right_index in range(index + 1, len(document_features)):
+            right = document_features[right_index]
+            right_tokens = token_sets[right_index]
+            shared_titles = left_titles & title_sets[right_index]
             similarity = _jaccard(left_tokens, right_tokens)
-            content_similarity = _cosine_similarity(
-                left.content_embedding, right.content_embedding
+            # A filename-dominant document was embedded from its file name, so
+            # its cosine similarity is filename evidence, not content evidence.
+            content_comparable = not (
+                left.quality_flags.filename_dominant
+                or right.quality_flags.filename_dominant
+            )
+            content_similarity = (
+                _cosine_similarity(left.content_embedding, right.content_embedding)
+                if content_comparable
+                else 0.0
             )
 
             evidence: list[str] = []
             edge_type = None
             score = 0.0
 
-            if (
-                left.content_text.strip()
-                and left.content_text.strip() == right.content_text.strip()
-            ):
+            if left_content and left_content == stripped_contents[right_index]:
                 edge_type = "near_duplicate"
                 score = max(content_similarity, 1.0)
                 evidence.append("identical_content")
-            elif shared_titles:
-                edge_type = "title_match"
-                score = 1.0
-                evidence.append(f"title_match:{sorted(shared_titles)[0]}")
             elif content_similarity >= min_content_similarity:
                 edge_type = "content_similarity"
                 score = content_similarity
                 evidence.append(f"content_similarity:{content_similarity:.3f}")
+                if shared_titles:
+                    evidence.append(f"title_match:{sorted(shared_titles)[0]}")
+            elif shared_titles:
+                edge_type = "title_match"
+                score = 1.0
+                evidence.append(f"title_match:{sorted(shared_titles)[0]}")
             elif (
                 similarity >= min_filename_token_overlap
                 and left_tokens
@@ -99,16 +135,7 @@ def build_candidate_edges(
                 quality_guard.append("filename_dominant")
 
             hard_constraint = None
-            if (
-                edge_type == "content_similarity"
-                and not left.content_text.strip()
-                and not right.content_text.strip()
-                and content_similarity >= 0.999
-            ):
-                edge_type = "near_duplicate"
-                hard_constraint = "must_link"
-                evidence.append("identical_content")
-            elif edge_type == "near_duplicate":
+            if edge_type == "near_duplicate":
                 hard_constraint = "must_link"
 
             edges.append(

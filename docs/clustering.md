@@ -123,6 +123,9 @@
 - `CandidateComponent` 已经区分 `near_duplicate_group` 和 `strong_semantic_group`。
 - 只有 near-duplicate 族群会在主题聚类前保守预绑定。
 - `cluster_representation.mode` 和 `cluster_adjudication.enable_llm_judging` 已有真实可选路径，但默认仍保持保守关闭或 deterministic。
+- 候选边里只有 `near_duplicate` 和 `content_similarity` 算内容证据。`title_match` 和 `filename_similarity` 只是线索：会写进报告、交给 LLM 裁决参考，但规则裁决不会因为它们产出 `merge_edge`，graph 模式也不会用它们成簇。
+- 标题候选会跳过 Docling 的 `<!-- image -->` 占位符、Markdown 图片和泛化标题（目录、摘要、Abstract、Chapter 1 之类），只看正文前 15 个非空行。文件名主干只作为展示兜底，不参与标题匹配。
+- `filename_dominant` 按最终正文判断：正文不超过 10 个字符时，`with_filename` 模式的 embedding 实际只来自文件名，这类文档之间的向量相似度不计入内容证据。主提取失败但 VLM 兜底拿到正文的文档不再算 `filename_dominant`。
 
 ## 外部最佳实践对照
 
