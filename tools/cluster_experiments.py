@@ -494,6 +494,7 @@ def _structure_metrics_payload(result: PipelineResult) -> dict[str, Any]:
     return {
         "density_validation_score": metrics.density_validation_score,
         "filename_bias_rate": metrics.filename_bias_rate,
+        "similarity_profile": metrics.similarity_profile,
     }
 
 

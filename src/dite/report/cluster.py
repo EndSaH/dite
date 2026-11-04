@@ -113,6 +113,11 @@ def build_report(
                 if structure_metrics is None
                 else structure_metrics.get("filename_bias_rate")
             ),
+            "similarity_profile": (
+                None
+                if structure_metrics is None
+                else structure_metrics.get("similarity_profile")
+            ),
         },
         "constraint_metrics": constraint_metrics or {},
         "partition_metrics": partition_metrics or {},

@@ -40,6 +40,7 @@ class StructureMetrics:
 
     density_validation_score: float | None = None
     filename_bias_rate: float | None = None
+    similarity_profile: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -245,7 +246,47 @@ def build_structure_metrics(
     return StructureMetrics(
         density_validation_score=density_validation_score,
         filename_bias_rate=filename_bias_rate,
+        similarity_profile=compute_similarity_profile(vectors),
     )
+
+
+SIMILARITY_PROFILE_SAMPLE = 2000
+
+
+def compute_similarity_profile(embeddings: np.ndarray) -> dict[str, float] | None:
+    """Summarize the corpus cosine-similarity distribution.
+
+    The clustering thresholds (content edges, small-cluster merge) are
+    absolute cosine values, but each embedding model uses its own similarity
+    range. These percentiles show where a threshold such as 0.92 falls for
+    this corpus and model: if ``pairwise_p99`` is already above it, unrelated
+    pairs will pass. Large corpora are sampled to keep this O(sample^2).
+    """
+    vectors = np.asarray(embeddings, dtype=np.float64)
+    if vectors.ndim != 2 or vectors.shape[0] < 2 or vectors.shape[1] == 0:
+        return None
+    norms = np.linalg.norm(vectors, axis=1)
+    vectors = vectors[norms > 0]
+    if vectors.shape[0] < 2:
+        return None
+    vectors = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+    if vectors.shape[0] > SIMILARITY_PROFILE_SAMPLE:
+        rng = np.random.default_rng(0)
+        rows = rng.choice(vectors.shape[0], SIMILARITY_PROFILE_SAMPLE, replace=False)
+        vectors = vectors[np.sort(rows)]
+    similarities = vectors @ vectors.T
+    upper = similarities[np.triu_indices(similarities.shape[0], k=1)]
+    np.fill_diagonal(similarities, -np.inf)
+    nearest = similarities.max(axis=1)
+    return {
+        "num_documents": int(vectors.shape[0]),
+        "pairwise_p50": float(np.percentile(upper, 50)),
+        "pairwise_p90": float(np.percentile(upper, 90)),
+        "pairwise_p99": float(np.percentile(upper, 99)),
+        "nearest_neighbor_p10": float(np.percentile(nearest, 10)),
+        "nearest_neighbor_p50": float(np.percentile(nearest, 50)),
+        "nearest_neighbor_p90": float(np.percentile(nearest, 90)),
+    }
 
 
 def _compute_density_validation_score(

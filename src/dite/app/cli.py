@@ -305,6 +305,7 @@ def _build_report(
         structure_metrics_payload = {
             "density_validation_score": structure_metrics.density_validation_score,
             "filename_bias_rate": structure_metrics.filename_bias_rate,
+            "similarity_profile": structure_metrics.similarity_profile,
         }
     if validation_root is not None:
         manifest_path = validation_root / "manifest.json"

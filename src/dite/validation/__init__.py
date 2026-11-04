@@ -13,6 +13,7 @@ from .metrics import (
     build_constraint_metrics,
     build_partition_metrics,
     build_structure_metrics,
+    compute_similarity_profile,
     is_gold_noise_cluster_id,
     partition_metrics_payload,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "build_constraint_metrics",
     "build_partition_metrics",
     "build_structure_metrics",
+    "compute_similarity_profile",
     "is_gold_noise_cluster_id",
     "partition_metrics_payload",
     "load_validation_corpus",

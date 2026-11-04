@@ -11,6 +11,7 @@ from dite.validation import (
     build_constraint_metrics,
     build_partition_metrics,
     build_structure_metrics,
+    compute_similarity_profile,
     load_validation_corpus,
     partition_metrics_payload,
 )
@@ -295,3 +296,28 @@ def test_partition_metrics_payload_is_json_ready(tmp_path: Path) -> None:
     payload = partition_metrics_payload(metrics)
 
     assert json.loads(json.dumps(payload))["bcubed_f1"] == pytest.approx(1.0)
+
+
+def test_similarity_profile_summarizes_cosine_distribution() -> None:
+    embeddings = np.array(
+        [[1.0, 0.0], [0.99, 0.141], [0.0, 1.0], [0.0, 0.0]], dtype=np.float32
+    )
+
+    profile = compute_similarity_profile(embeddings)
+
+    # The zero vector is ignored; pairs: 0.99, 0.0, 0.141.
+    assert profile["num_documents"] == 3
+    assert profile["pairwise_p50"] == pytest.approx(0.141, abs=1e-3)
+    pairs = [0.0, 0.141, 0.99]
+    assert profile["pairwise_p99"] == pytest.approx(np.percentile(pairs, 99), abs=1e-3)
+    assert profile["nearest_neighbor_p90"] == pytest.approx(0.99, abs=0.01)
+    assert compute_similarity_profile(np.zeros((1, 2))) is None
+
+
+def test_structure_metrics_include_similarity_profile(tmp_path: Path) -> None:
+    result = _pipeline_result(tmp_path, [0, 0, 1])
+
+    metrics = build_structure_metrics(result)
+
+    assert metrics.similarity_profile is not None
+    assert metrics.similarity_profile["num_documents"] == 3

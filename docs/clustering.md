@@ -80,6 +80,17 @@
   - 报告 summary 里的 `adjudication_clusters_merged`、`adjudication_noise_attached` 记录了这一步的效果。
 - graph 模式
   - 成簇用的边阈值读 `candidate_generation.component_min_edge_score`，不再写死 0.9。
+
+### 阈值和 embedding 模型的关系
+
+内容边（`content_similarity_threshold`）、小簇合并（`small_cluster_merge_cosine_threshold`）、规则裁决（`edge_merge_threshold`）用的都是绝对余弦值，默认 0.92。不同 embedding 模型的相似度区间差别很大：有的模型里无关文档也有 0.8 以上的相似度。换模型后，这些阈值的含义就变了。
+
+`scan` 报告和实验工具的 `structure_metrics.similarity_profile` 会给出当前语料的相似度分布：
+
+- `pairwise_p50` / `p90` / `p99`：所有文档两两之间余弦相似度的分位数
+- `nearest_neighbor_p10` / `p50` / `p90`：每篇文档与最相近文档的相似度分位数
+
+判读方法：如果 `pairwise_p99` 已经高于 0.92，说明随机两篇文档里就有 1% 会被当成内容强边，阈值偏松；如果 `nearest_neighbor_p90` 都低于 0.92，说明内容强边几乎不会出现，阈值偏紧。阈值的调整应该参考这些分位数，并在 `docs/validation.md` 的验证集上确认 `partition_metrics` 没有变差。
 - 小簇级再合并
   - `merge_small_clusters_by_similarity()` 只处理 source 小簇。
   - target 只要求是另一个非噪音簇，不要求必须是大簇。
