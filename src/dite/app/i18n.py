@@ -133,6 +133,15 @@ class Messages:
     undo_done: str
     undo_skipped_missing: str
     undo_skipped_conflict: str
+    assign_description: str
+    cli_help_folder_assign: str
+    cli_help_assign_target: str
+    cli_help_min_similarity: str
+    assign_no_categories: str
+    assign_no_new_files: str
+    assign_summary: str
+    assign_decision: str
+    assign_decision_unsorted: str
     organize_cancelled: str
     organize_dry_run_hint: str
     organize_script_header: str
@@ -434,6 +443,27 @@ ZH_CN = Messages(
     undo_done="撤销完成: {restored} 个已移回, {skipped} 个跳过",
     undo_skipped_missing="跳过（整理后的文件已不存在）: {path}",
     undo_skipped_conflict="跳过（原位置已有同名文件）: {path}",
+    assign_description="把新文件归入已有的子文件夹",
+    cli_help_folder_assign="包含新文件的文件夹",
+    cli_help_assign_target=(
+        "已有分类子文件夹所在的目录（默认就是 FOLDER，此时只处理 FOLDER "
+        "根目录下的散落文件）"
+    ),
+    cli_help_min_similarity=(
+        "最低余弦相似度；不设时由每个文件夹自身成员的相似度分布决定门槛"
+    ),
+    assign_no_categories=(
+        "{target} 下没有可用的子文件夹（至少需要一个含受支持文件的子文件夹）"
+    ),
+    assign_no_new_files="没有需要归档的新文件",
+    assign_summary=(
+        "{assigned} 个文件可以归入已有文件夹，{unsorted} 个不够接近、保持原位"
+    ),
+    assign_decision="{file} → {folder}（相似度 {similarity:.3f}，门槛 {floor:.3f}）",
+    assign_decision_unsorted=(
+        "{file} 保持原位（最接近 {folder}，相似度 {similarity:.3f}，门槛 "
+        "{floor}）"
+    ),
     organize_cancelled="已取消",
     organize_dry_run_hint=(
         "这是预览模式。使用 --execute 执行或 --output-script 生成脚本。"
@@ -818,6 +848,30 @@ EN = Messages(
     undo_skipped_missing="Skipped (the moved file no longer exists): {path}",
     undo_skipped_conflict=(
         "Skipped (a file already exists at the original location): {path}"
+    ),
+    assign_description="Sort new files into existing subfolders",
+    cli_help_folder_assign="Folder that contains the new files",
+    cli_help_assign_target=(
+        "Folder whose subfolders are the existing categories (default: FOLDER "
+        "itself; then only loose files at its top level are sorted)"
+    ),
+    cli_help_min_similarity=(
+        "Minimum cosine similarity; by default each folder's own member spread "
+        "sets the bar"
+    ),
+    assign_no_categories=(
+        "No usable subfolders in {target} (need at least one subfolder with "
+        "supported files)"
+    ),
+    assign_no_new_files="No new files to sort",
+    assign_summary=(
+        "{assigned} files match an existing folder; {unsorted} are not close "
+        "enough and stay in place"
+    ),
+    assign_decision="{file} -> {folder} (similarity {similarity:.3f}, bar {floor:.3f})",
+    assign_decision_unsorted=(
+        "{file} stays (closest: {folder}, similarity {similarity:.3f}, bar "
+        "{floor})"
     ),
     organize_cancelled="Cancelled",
     organize_dry_run_hint=(

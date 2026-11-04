@@ -253,9 +253,14 @@ def _run_pipeline_or_exit(
     cache: FileCache | None,
 ) -> PipelineResult:
     """Run pipeline and convert runtime/API failures to user-friendly CLI errors."""
+    return _call_pipeline_or_exit(lambda: pipeline.run(folder, options), cache)
+
+
+def _call_pipeline_or_exit(call, cache: FileCache | None):
+    """Run a pipeline call; report runtime/API failures and exit with code 1."""
     logger = get_logger()
     try:
-        return pipeline.run(folder, options)
+        return call()
     except (APIConnectionError, APITimeoutError):
         logger.error(t("error_api_connection_failed"))
     except APIError as exc:
@@ -807,6 +812,190 @@ def organize(
         files=result.files,
         labels=result.labels,
         cluster_names=result.cluster_names,
+    )
+    _finalize_organize_run(
+        preview=preview,
+        logger=logger,
+        output_script=output_script,
+        execute=execute,
+    )
+
+
+@app.command(help=_help_key("assign_description"))
+def assign(
+    ctx: typer.Context,
+    folder: Annotated[
+        Path,
+        typer.Argument(help=_help_key("cli_help_folder_assign")),
+    ],
+    target: Annotated[
+        Path | None,
+        typer.Option("--target", "-t", help=_help_key("cli_help_assign_target")),
+    ] = None,
+    min_similarity: Annotated[
+        float | None,
+        typer.Option(
+            "--min-similarity", help=_help_key("cli_help_min_similarity")
+        ),
+    ] = None,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help=_help_key("cli_help_verbose")),
+    ] = False,
+    quiet: Annotated[
+        bool,
+        typer.Option("--quiet", "-q", help=_help_key("cli_help_quiet")),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help=_help_key("cli_help_preview_mode")),
+    ] = False,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help=_help_key("cli_help_execute_move")),
+    ] = False,
+    output_script: Annotated[
+        Path | None,
+        typer.Option("--output-script", help=_help_key("cli_help_output_script")),
+    ] = None,
+    no_cache: Annotated[
+        bool,
+        typer.Option("--no-cache", help=_help_key("cli_help_disable_cache")),
+    ] = False,
+):
+    """Sort new files into the existing subfolders of a target folder."""
+    from rich.markup import escape
+
+    from dite.flow.assign import (
+        assign_to_folders,
+        build_folder_profiles,
+        list_category_folders,
+    )
+    from dite.flow.scan import scan_files
+
+    if verbose or quiet:
+        setup_logging(verbose=verbose, quiet=quiet)
+    logger = get_logger()
+    config = _get_app_config(ctx)
+
+    if not dry_run and not execute and not output_script:
+        logger.warning(t("organize_specify_mode"))
+        logger.print(t("organize_mode_help"))
+        raise typer.Exit(1)
+    if not folder.is_dir():
+        logger.error(t("organize_folder_not_found", folder=escape(str(folder))))
+        raise typer.Exit(1)
+
+    target_folder = target if target is not None else folder
+    if not target_folder.is_dir():
+        logger.error(
+            t("organize_folder_not_found", folder=escape(str(target_folder)))
+        )
+        raise typer.Exit(1)
+
+    extensions = config.formats.all_extensions
+    members_by_folder: dict[str, list[Path]] = {}
+    for category in list_category_folders(target_folder):
+        members = scan_files(category, config=config, extensions=extensions)
+        if members:
+            members_by_folder[category.name] = members
+    if not members_by_folder:
+        logger.error(t("assign_no_categories", target=escape(str(target_folder))))
+        raise typer.Exit(1)
+
+    if target is None:
+        # Loose files at the top level are new; subfolders are categories.
+        new_files = scan_files(
+            folder, config=config, extensions=extensions, recursive=False
+        )
+    else:
+        new_files = scan_files(
+            folder,
+            config=config,
+            extensions=extensions,
+            exclude_paths=[target_folder.resolve()],
+        )
+    if not new_files:
+        logger.print(t("assign_no_new_files"))
+        return
+
+    logger.print(f"[bold blue]{t('cli_title')}[/bold blue]\n")
+    member_files = [file for files in members_by_folder.values() for file in files]
+    cache = (
+        FileCache(
+            cache_dir=config.cache.directory,
+            max_size_gb=config.cache.max_size_gb,
+        )
+        if not no_cache and config.cache.enabled
+        else None
+    )
+    pipeline = _get_pipeline_service_cls()(
+        client=_get_client(config), config=config, cache=cache
+    )
+    options = _get_pipeline_options_cls()(
+        use_cache=cache is not None, use_embedding_cache=True
+    )
+    embedded = _call_pipeline_or_exit(
+        lambda: pipeline.embed_files([*member_files, *new_files], options), cache
+    )
+    if cache:
+        cache.close()
+
+    vectors_by_file = dict(zip(embedded.files, embedded.embeddings, strict=True))
+    profiles = build_folder_profiles(
+        {
+            name: np.stack([vectors_by_file[file] for file in files])
+            for name, files in members_by_folder.items()
+        }
+    )
+    decisions = assign_to_folders(
+        new_files,
+        np.stack([vectors_by_file[file] for file in new_files]),
+        profiles,
+        min_similarity=min_similarity,
+    )
+
+    preview = _get_organize_preview_cls()(
+        source_folder=folder, target_folder=target_folder
+    )
+    assigned_by_folder: dict[str, list[Path]] = {}
+    unsorted: list[Path] = []
+    for decision in decisions:
+        if decision.folder is None:
+            unsorted.append(decision.file)
+            if decision.similarity is not None:
+                logger.debug(
+                    t(
+                        "assign_decision_unsorted",
+                        file=escape(decision.file.name),
+                        folder=escape(decision.closest or "-"),
+                        similarity=decision.similarity,
+                        floor=(
+                            "-" if decision.floor is None else f"{decision.floor:.3f}"
+                        ),
+                    )
+                )
+            continue
+        assigned_by_folder.setdefault(decision.folder, []).append(decision.file)
+        logger.debug(
+            t(
+                "assign_decision",
+                file=escape(decision.file.name),
+                folder=escape(decision.folder),
+                similarity=decision.similarity,
+                floor=decision.floor,
+            )
+        )
+    for name in sorted(assigned_by_folder):
+        preview.add_existing_folder(name, assigned_by_folder[name])
+    preview.add_noise(unsorted)
+
+    logger.print(
+        t(
+            "assign_summary",
+            assigned=sum(len(files) for files in assigned_by_folder.values()),
+            unsorted=len(unsorted),
+        )
     )
     _finalize_organize_run(
         preview=preview,

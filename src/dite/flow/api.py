@@ -23,6 +23,7 @@ from dite.doc import DocumentFeatures
 from dite.doc.embed import (
     ContentTruncator,
     get_embeddings,
+    normalize_embeddings,
 )
 from dite.io import (
     ExtractorRegistry,
@@ -497,6 +498,70 @@ class PipelineService:
             cluster_drafts=[],
             extraction=extraction_stage.summary,
             file_reports=extraction_stage.file_reports,
+        )
+
+    def embed_files(
+        self, files: list[Path], options: PipelineOptions
+    ) -> PipelineResult:
+        """Extract and embed files without clustering or naming.
+
+        Uses the same content and embedding caches as ``run``; identical
+        files are embedded once. Labels are all ``-1``.
+        """
+        self.logger = get_logger()
+        if not files:
+            return PipelineResult(
+                files=[],
+                contents=[],
+                embeddings=np.array([]),
+                labels=np.array([], dtype=int),
+                cluster_names={},
+                extraction=ExtractionSummary(),
+                file_reports=[],
+            )
+
+        with self._request_runtime_scope():
+            contents, file_hashes, extraction, file_reports = self._extract_contents(
+                files, options
+            )
+            canonical_indices = self._canonical_indices(file_hashes)
+            canonical_files = [files[index] for index in canonical_indices]
+            canonical_hashes = [file_hashes[index] for index in canonical_indices]
+            texts = [contents[index] for index in canonical_indices]
+            if options.embedding_input_mode == "summary":
+                from dite.doc import build_document_features
+                from dite.doc.build import build_summary_embedding_text
+
+                texts = [
+                    build_summary_embedding_text(
+                        build_document_features(
+                            files[index],
+                            contents[index],
+                            config=self.config,
+                            client=self.client,
+                            file_report=file_reports[index],
+                        )
+                    )
+                    for index in canonical_indices
+                ]
+            canonical_embeddings = normalize_embeddings(
+                self._vectorize(canonical_files, canonical_hashes, texts, options)
+            )
+            embeddings = self._expand_by_file_hashes(
+                canonical_indices,
+                canonical_embeddings,
+                file_hashes,
+                len(files),
+            )
+
+        return PipelineResult(
+            files=files,
+            contents=contents,
+            embeddings=embeddings,
+            labels=np.full(len(files), -1, dtype=int),
+            cluster_names={},
+            extraction=extraction,
+            file_reports=file_reports,
         )
 
     def _extract_contents(
