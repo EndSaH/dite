@@ -6,10 +6,13 @@ already accepted, so instead each existing subfolder acts as a category and
 each new file joins the folder whose content it is closest to.
 
 How close is close enough is judged per folder, not with one global cosine
-value: a folder's bar is set by how similar its own members are to the rest
-of that folder. A tight folder (one course, one project) accepts only close
-matches; a broad folder accepts looser ones. This keeps the rule meaningful
-across embedding models, whose absolute similarity ranges differ.
+value. Each folder compares two distributions: how similar its own members
+are to the rest of the folder (insiders) and how similar files from the
+other folders are to it (outsiders). The bar sits halfway between the least
+typical insiders and the most typical outsiders, like a one-dimensional
+classifier boundary. This keeps the rule meaningful across embedding
+models, whose absolute similarity ranges differ, and does not reject new
+files just because a folder's members happen to be near-identical.
 """
 
 from __future__ import annotations
@@ -21,9 +24,10 @@ import numpy as np
 
 from dite.doc.embed import normalize_embeddings
 
-# A new file must be at least as similar to a folder as the members in the
-# folder's least-typical 10% are.
+# Insiders: the least typical 10% of a folder's members.
 FOLDER_FLOOR_PERCENTILE = 10.0
+# Outsiders: the 10% of other folders' files that look most like this folder.
+OUTSIDER_CEILING_PERCENTILE = 90.0
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,8 @@ class FolderProfile:
     member_count: int
     centroid: np.ndarray
     floor: float | None  # None when the folder has too few members to tell
+    insider_floor: float | None = None
+    outsider_ceiling: float | None = None
 
 
 @dataclass(frozen=True)
@@ -52,33 +58,63 @@ class AssignmentDecision:
 def build_folder_profiles(
     members_by_folder: dict[str, np.ndarray],
 ) -> list[FolderProfile]:
-    """Build centroid profiles from each folder's member embeddings.
+    """Build centroid profiles and acceptance bars from member embeddings.
 
-    The floor uses leave-one-out similarity: each member is compared with the
+    Insider similarity is leave-one-out: each member is compared with the
     centroid of the *other* members, so a member does not vouch for itself.
-    Folders with one member get no floor of their own; they borrow the median
-    floor of the other folders when the decision is made.
+    The bar is the midpoint between the insiders' 10th percentile and the
+    outsiders' 90th percentile. When the two overlap (the folder is not
+    separable from the others) the stricter insider value is used; with no
+    other folders, the insider value alone. Folders with one member get no
+    bar of their own and borrow the median bar of the others later.
     """
+    names = sorted(
+        name
+        for name, vectors in members_by_folder.items()
+        if np.asarray(vectors).ndim == 2 and np.asarray(vectors).shape[0] > 0
+    )
+    normalized = {
+        name: normalize_embeddings(np.asarray(members_by_folder[name]))
+        for name in names
+    }
+    centroids = {
+        name: normalize_embeddings(vectors.mean(axis=0))
+        for name, vectors in normalized.items()
+    }
+
     profiles: list[FolderProfile] = []
-    for name in sorted(members_by_folder):
-        vectors = normalize_embeddings(np.asarray(members_by_folder[name]))
-        if vectors.ndim != 2 or vectors.shape[0] == 0:
-            continue
-        total = vectors.sum(axis=0)
-        centroid = normalize_embeddings(total / vectors.shape[0])
-        floor = None
+    for name in names:
+        vectors = normalized[name]
+        insider_floor = None
         if vectors.shape[0] >= 2:
+            total = vectors.sum(axis=0)
             leave_one_out = normalize_embeddings(
                 (total[None, :] - vectors) / (vectors.shape[0] - 1)
             )
-            similarities = np.sum(vectors * leave_one_out, axis=1)
-            floor = float(np.percentile(similarities, FOLDER_FLOOR_PERCENTILE))
+            insiders = np.sum(vectors * leave_one_out, axis=1)
+            insider_floor = float(np.percentile(insiders, FOLDER_FLOOR_PERCENTILE))
+        others = [normalized[other] for other in names if other != name]
+        outsider_ceiling = None
+        if others:
+            outsiders = np.concatenate(others) @ centroids[name]
+            outsider_ceiling = float(
+                np.percentile(outsiders, OUTSIDER_CEILING_PERCENTILE)
+            )
+        floor = insider_floor
+        if (
+            insider_floor is not None
+            and outsider_ceiling is not None
+            and insider_floor > outsider_ceiling
+        ):
+            floor = (insider_floor + outsider_ceiling) / 2
         profiles.append(
             FolderProfile(
                 name=name,
                 member_count=int(vectors.shape[0]),
-                centroid=centroid,
+                centroid=centroids[name],
                 floor=floor,
+                insider_floor=insider_floor,
+                outsider_ceiling=outsider_ceiling,
             )
         )
     return profiles

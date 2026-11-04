@@ -721,3 +721,30 @@ def test_undo_round_trips_non_utf8_and_special_names(tmp_path: Path) -> None:
 
     assert len(result.restored) == len(files)
     assert all(path.exists() for path in files)
+
+
+def test_empty_execute_writes_no_journal_and_does_not_hide_older_ones(
+    tmp_path: Path,
+) -> None:
+    from dite.flow.move import JOURNAL_DIR_NAME, MoveJournal, find_latest_journal
+
+    preview, _files = _organize_with_journal(tmp_path)
+    real_journal = preview.journal_path
+
+    # A later run with nothing to move (e.g. assign found no matches).
+    empty_run = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=preview.target_folder
+    )
+    assert empty_run.execute(
+        dry_run=False, journal_dir=preview.target_folder / JOURNAL_DIR_NAME
+    ) == (0, 0)
+    assert empty_run.journal_path is None
+
+    # Even a journal that recorded no successful move is skipped.
+    MoveJournal.create(
+        preview.target_folder / JOURNAL_DIR_NAME,
+        source_folder=tmp_path / "src",
+        target_folder=preview.target_folder,
+    ).close()
+
+    assert find_latest_journal(preview.target_folder) == real_journal

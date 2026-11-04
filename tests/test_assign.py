@@ -195,3 +195,35 @@ def test_assign_cli_requires_category_folders(tmp_path: Path, monkeypatch) -> No
     result = CliRunner().invoke(app, ["assign", str(root), "--dry-run"])
 
     assert result.exit_code == 1
+
+
+def test_near_identical_members_do_not_make_the_bar_unreachable() -> None:
+    # Members of each folder are almost identical (long documents on one
+    # topic), so the insider-only bar would be ~0.99. A shorter new file on
+    # the same topic is far closer to its folder than any outsider is, and
+    # must still be accepted.
+    algebra, cooking, invoices = _direction(80), _direction(81), _direction(82)
+    profiles = build_folder_profiles(
+        {
+            "algebra": _members(algebra, 5, 0.01, seed=83),
+            "cooking": _members(cooking, 5, 0.01, seed=84),
+            "invoices": _members(invoices, 5, 0.01, seed=85),
+        }
+    )
+    by_name = {profile.name: profile for profile in profiles}
+    assert by_name["algebra"].insider_floor > 0.99
+    assert by_name["algebra"].outsider_ceiling < 0.5
+
+    # cos(new_file, algebra) ~ 0.86: below the insider-only bar (~0.99) but
+    # far above every outsider.
+    new_file = algebra + 0.6 * _direction(86)
+    decisions = assign_to_folders(
+        [Path("short-algebra.md"), Path("unrelated.md")],
+        np.stack([new_file, _direction(87)]),
+        profiles,
+    )
+
+    assert decisions[0].similarity < by_name["algebra"].insider_floor
+    assert decisions[0].folder == "algebra"
+    assert decisions[0].floor < by_name["algebra"].insider_floor
+    assert decisions[1].folder is None

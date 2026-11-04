@@ -263,13 +263,15 @@ class OrganizePreview:
 
         success = 0
         failed = 0
+        # A run with nothing to move leaves no journal: an empty journal would
+        # otherwise become "the latest" and hide the real one from undo.
         journal = (
             MoveJournal.create(
                 journal_dir,
                 source_folder=self.source_folder,
                 target_folder=self.target_folder,
             )
-            if journal_dir is not None
+            if journal_dir is not None and self.operations
             else None
         )
         self.journal_path = journal.path if journal is not None else None
@@ -440,7 +442,11 @@ def read_journal(path: Path) -> JournalContents:
 
 
 def find_latest_journal(target_folder: Path) -> Path | None:
-    """Return the newest journal under ``target/.dite`` that is not undone."""
+    """Return the newest journal under ``target/.dite`` with moves to undo.
+
+    Journals that are already undone, or that recorded no successful move
+    (every copy failed), are skipped.
+    """
     journal_dir = Path(target_folder) / JOURNAL_DIR_NAME
     if not journal_dir.is_dir():
         return None
@@ -449,10 +455,11 @@ def find_latest_journal(target_folder: Path) -> Path | None:
     )
     for candidate in candidates:
         try:
-            if not read_journal(candidate).undone:
-                return candidate
+            contents = read_journal(candidate)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
+        if not contents.undone and contents.moves:
+            return candidate
     return None
 
 
