@@ -120,6 +120,8 @@ class ClusterMetrics:
     name_clusters_merged: int = 0
     small_cluster_merge_candidates: int = 0
     small_cluster_merge_skipped: int = 0
+    adjudication_clusters_merged: int = 0
+    adjudication_noise_attached: int = 0
     small_cluster_merge_max_similarity: float | None = None
     small_cluster_merge_events: list[SmallClusterMergeEvent] = field(
         default_factory=list

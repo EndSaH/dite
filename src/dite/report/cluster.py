@@ -92,6 +92,8 @@ def build_report(
             ),
             "small_cluster_merge_candidates": metrics.small_cluster_merge_candidates,
             "small_cluster_merge_skipped": metrics.small_cluster_merge_skipped,
+            "adjudication_clusters_merged": metrics.adjudication_clusters_merged,
+            "adjudication_noise_attached": metrics.adjudication_noise_attached,
             "num_document_features": len(document_features or []),
             "num_candidate_edges": len(candidate_edges or []),
             "num_candidate_components": len(candidate_components or []),

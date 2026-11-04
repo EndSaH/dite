@@ -71,7 +71,15 @@
 
 - 噪音修复
   - `repair_noise_with_knn()` 只给噪音点分配已有簇标签。
+  - 先由 k 个近邻投票选簇，再检查噪音点到"这个簇里最近成员"的距离是否在阈值内。以前检查的是到全体最近邻的距离，而最近邻可能属于另一个簇，导致点被分进一个其实离它很远的簇。
   - 如果 HDBSCAN 结果全是噪音，会走 `repair_all_noise_with_similarity()` 这条保守回退路径。
+- 裁决结果（`merge_edge`）按簇生效
+  - 噪音文件和已成簇文件之间有 `merge_edge`：噪音文件并入那个簇；连到多个簇时按边数多数决定。
+  - 两个已成形的簇之间：只有跨簇 `merge_edge` 覆盖了较小簇至少一半的成员时才整簇合并。单独一条边不会再把某个文件从原簇里拽出来。
+  - 两个噪音文件之间：保持噪音。
+  - 报告 summary 里的 `adjudication_clusters_merged`、`adjudication_noise_attached` 记录了这一步的效果。
+- graph 模式
+  - 成簇用的边阈值读 `candidate_generation.component_min_edge_score`，不再写死 0.9。
 - 小簇级再合并
   - `merge_small_clusters_by_similarity()` 只处理 source 小簇。
   - target 只要求是另一个非噪音簇，不要求必须是大簇。

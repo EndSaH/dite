@@ -141,13 +141,30 @@ def apply_candidate_component_links(
     )
 
 
+ADJUDICATION_CLUSTER_MERGE_SUPPORT = 0.5
+
+
 def apply_adjudication_links(
     result: ClusterResult,
     canonical_document_features: list[DocumentFeatures],
     adjudication_requests: list[AdjudicationRequest],
     adjudication_decisions: list[AdjudicationDecision],
+    *,
+    cluster_merge_support: float = ADJUDICATION_CLUSTER_MERGE_SUPPORT,
 ) -> ClusterResult:
-    """Apply merge decisions from the adjudication layer to cluster labels."""
+    """Apply ``merge_edge`` decisions at cluster level.
+
+    A merge edge is evidence about two documents, so it is applied without
+    tearing either document out of the cluster it already belongs to:
+
+    - noise linked to a clustered document joins that cluster (by majority
+      when it links to several);
+    - two different clusters merge only when merge edges reach at least
+      ``cluster_merge_support`` of the smaller cluster's members, so one
+      stray pair cannot fuse two topics or split a member off;
+    - two noise documents stay noise (a pair is below any useful cluster
+      size).
+    """
     if not adjudication_decisions:
         return result
 
@@ -156,9 +173,15 @@ def apply_adjudication_links(
         feature.file_id: index
         for index, feature in enumerate(canonical_document_features)
     }
-    labels = result.labels.copy()
-    merged_any = False
+    initial = result.labels.copy()
+    sizes: dict[int, int] = {}
+    for label in initial.tolist():
+        if label != -1:
+            sizes[label] = sizes.get(label, 0) + 1
 
+    # endpoints[(a, b)][a] = members of cluster a with a merge edge into b
+    endpoints: dict[tuple[int, int], dict[int, set[int]]] = {}
+    noise_votes: dict[int, list[int]] = {}
     for decision in adjudication_decisions:
         if decision.decision != "merge_edge":
             continue
@@ -170,27 +193,70 @@ def apply_adjudication_links(
             continue
         left_index = index_by_file_id[left_id]
         right_index = index_by_file_id[right_id]
-        left_label = int(labels[left_index])
-        right_label = int(labels[right_index])
-        non_noise_labels = [label for label in (left_label, right_label) if label != -1]
-        if not non_noise_labels:
+        left_label = int(initial[left_index])
+        right_label = int(initial[right_index])
+        if left_label == -1 and right_label == -1:
             continue
-        target_label = min(non_noise_labels)
-        if labels[left_index] != target_label:
-            labels[left_index] = target_label
-            merged_any = True
-        if labels[right_index] != target_label:
-            labels[right_index] = target_label
-            merged_any = True
+        if left_label == -1:
+            noise_votes.setdefault(left_index, []).append(right_label)
+            continue
+        if right_label == -1:
+            noise_votes.setdefault(right_index, []).append(left_label)
+            continue
+        if left_label == right_label:
+            continue
+        key = (min(left_label, right_label), max(left_label, right_label))
+        side = endpoints.setdefault(key, {key[0]: set(), key[1]: set()})
+        side[left_label].add(left_index)
+        side[right_label].add(right_index)
 
-    if not merged_any:
+    parent: dict[int, int] = {label: label for label in sizes}
+
+    def find(label: int) -> int:
+        while parent[label] != label:
+            parent[label] = parent[parent[label]]
+            label = parent[label]
+        return label
+
+    clusters_merged = 0
+    for (low, high), side in sorted(endpoints.items()):
+        smaller = low if sizes[low] <= sizes[high] else high
+        coverage = len(side[smaller]) / sizes[smaller]
+        if coverage < cluster_merge_support:
+            continue
+        root_low, root_high = find(low), find(high)
+        if root_low == root_high:
+            continue
+        parent[max(root_low, root_high)] = min(root_low, root_high)
+        clusters_merged += 1
+
+    labels = np.array(
+        [find(label) if label != -1 else -1 for label in initial.tolist()],
+        dtype=int,
+    )
+    noise_attached = 0
+    for index, votes in sorted(noise_votes.items()):
+        roots = [find(label) for label in votes]
+        best = min(set(roots), key=lambda root: (-roots.count(root), root))
+        labels[index] = best
+        noise_attached += 1
+
+    if clusters_merged == 0 and noise_attached == 0:
         return result
 
     return ClusterResult(
         labels=labels,
         cluster_names=result.cluster_names.copy(),
         repaired_mask=result.repaired_mask.copy(),
-        metrics=dataclasses.replace(result.metrics),
+        metrics=dataclasses.replace(
+            result.metrics,
+            adjudication_clusters_merged=(
+                result.metrics.adjudication_clusters_merged + clusters_merged
+            ),
+            adjudication_noise_attached=(
+                result.metrics.adjudication_noise_attached + noise_attached
+            ),
+        ),
     )
 
 
@@ -231,7 +297,7 @@ def cluster_canonical_documents(
         adjacency: dict[int, set[int]] = {
             index: set() for index in range(len(canonical_document_features))
         }
-        min_edge_score = 0.9
+        min_edge_score = config.candidate_generation.component_min_edge_score
         for edge in candidate_edges:
             if edge.score < min_edge_score:
                 continue

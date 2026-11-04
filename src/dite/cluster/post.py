@@ -226,7 +226,15 @@ def repair_noise_with_knn(
     knn.fit(X_core, y_core)
 
     predictions = knn.predict(X_noise)
-    distances, _ = knn.kneighbors(X_noise)
+    neighbor_distances, neighbor_indices = knn.kneighbors(X_noise)
+    # Gate on the nearest neighbour that actually belongs to the voted
+    # cluster. The overall nearest neighbour may sit in a different cluster
+    # than the k-vote picked, which let a point join cluster A because it was
+    # close to a member of cluster B.
+    predicted_distances = np.empty(len(predictions), dtype=float)
+    for row, pred in enumerate(predictions):
+        same_cluster = y_core[neighbor_indices[row]] == pred
+        predicted_distances[row] = float(np.min(neighbor_distances[row][same_cluster]))
 
     if distance_threshold is None:
         core_dist_matrix = cosine_distances(X_core, X_core)
@@ -248,7 +256,7 @@ def repair_noise_with_knn(
 
     repaired_count = 0
     for pred, dist, idx in zip(
-        predictions, distances[:, 0], noise_indices, strict=False
+        predictions, predicted_distances, noise_indices, strict=False
     ):
         item_name = item_names[idx] if item_names is not None else f"#{idx}"
         debug_label = debug_labels.get(int(pred), str(pred))

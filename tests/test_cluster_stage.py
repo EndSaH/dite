@@ -10,10 +10,15 @@ from dite.cluster.algo import (
     cluster_documents_agglomerative,
     reduce_for_density_clustering,
 )
-from dite.cluster.api import cluster_documents
+from dite.cluster.api import cluster_documents, repair_noise_with_knn
 from dite.cluster.link import build_candidate_edges
-from dite.cluster.model import ClusterMetrics, ClusterResult
-from dite.cluster.stage import cluster_canonical_documents
+from dite.cluster.model import (
+    AdjudicationDecision,
+    AdjudicationRequest,
+    ClusterMetrics,
+    ClusterResult,
+)
+from dite.cluster.stage import apply_adjudication_links, cluster_canonical_documents
 from dite.doc import build_document_features
 from dite.flow.model import PipelineOptions
 
@@ -236,3 +241,130 @@ def test_cluster_documents_runs_hdbscan_on_cluster_inputs() -> None:
     assert _same_partition(result.labels.tolist(), gold)
     with pytest.raises(ValueError, match="one row per embedding"):
         cluster_documents(embeddings, config=Config(), cluster_inputs=embeddings[:3])
+
+
+def _unit(angle_degrees: float) -> list[float]:
+    radians = np.deg2rad(angle_degrees)
+    return [float(np.cos(radians)), float(np.sin(radians))]
+
+
+def test_knn_repair_gates_on_distance_to_the_voted_cluster() -> None:
+    # Noise at 0 deg. Its single nearest neighbour (2 deg) is in cluster 1,
+    # but the 3-vote picks cluster 0, whose closest member is 30 deg away.
+    embeddings = np.array(
+        [_unit(30), _unit(32), _unit(34), _unit(2), _unit(0)], dtype=np.float32
+    )
+    labels = np.array([0, 0, 0, 1, -1], dtype=int)
+
+    repaired, count = repair_noise_with_knn(
+        embeddings, labels, k=3, distance_threshold=0.05
+    )
+
+    assert count == 0
+    assert repaired.tolist() == [0, 0, 0, 1, -1]
+
+    # Within the threshold of the voted cluster it is still repaired.
+    repaired, count = repair_noise_with_knn(
+        embeddings, labels, k=3, distance_threshold=0.2
+    )
+    assert count == 1
+    assert repaired[-1] == 0
+
+
+def _merge_request(index: int, left: str, right: str):
+    request = AdjudicationRequest(
+        request_id=f"edge:{index}",
+        request_type="edge_review",
+        subjects=[left, right],
+        trigger_reason="content_similarity",
+        score=0.95,
+    )
+    decision = AdjudicationDecision(
+        request_id=request.request_id,
+        decision="merge_edge",
+        confidence=0.95,
+        reason="test",
+    )
+    return request, decision
+
+
+def _adjudicate(labels: list[int], pairs: list[tuple[int, int]]):
+    features = [
+        build_document_features(Path(f"docs/doc-{index}.md"), f"Body {index}")
+        for index in range(len(labels))
+    ]
+    requests, decisions = [], []
+    for number, (left, right) in enumerate(pairs):
+        request, decision = _merge_request(
+            number, features[left].file_id, features[right].file_id
+        )
+        requests.append(request)
+        decisions.append(decision)
+    result = ClusterResult(
+        labels=np.array(labels, dtype=int),
+        cluster_names={},
+        repaired_mask=np.zeros(len(labels), dtype=bool),
+        metrics=ClusterMetrics(),
+    )
+    return apply_adjudication_links(result, features, requests, decisions)
+
+
+def test_single_merge_edge_does_not_tear_a_document_out_of_its_cluster() -> None:
+    labels = [0, 0, 0, 0, 1, 1, 1, 1]
+
+    result = _adjudicate(labels, [(3, 4)])
+
+    assert result.labels.tolist() == labels
+    assert result.metrics.adjudication_clusters_merged == 0
+
+
+def test_merge_edges_covering_half_the_smaller_cluster_merge_clusters() -> None:
+    labels = [0, 0, 0, 0, 0, 0, 1, 1, 1, 1]
+
+    result = _adjudicate(labels, [(0, 6), (1, 7)])
+
+    assert result.labels.tolist() == [0] * 10
+    assert result.metrics.adjudication_clusters_merged == 1
+
+
+def test_merge_edge_attaches_noise_and_leaves_noise_pairs_alone() -> None:
+    labels = [0, 0, 0, 1, 1, 1, -1, -1, -1]
+
+    result = _adjudicate(labels, [(6, 0), (6, 1), (6, 3), (7, 8)])
+
+    # Doc 6 links to cluster 0 twice and cluster 1 once: majority wins.
+    assert result.labels.tolist() == [0, 0, 0, 1, 1, 1, 0, -1, -1]
+    assert result.metrics.adjudication_noise_attached == 1
+    assert result.metrics.adjudication_clusters_merged == 0
+
+
+def test_graph_mode_uses_configured_component_edge_threshold() -> None:
+    paths = [Path("a/one.md"), Path("b/two.md")]
+    features = [
+        build_document_features(path, f"Distinct body for {path.stem}")
+        for path in paths
+    ]
+    embeddings = np.array([[1.0, 0.0], [0.95, 0.312]], dtype=np.float32)
+    for feature, embedding in zip(features, embeddings, strict=True):
+        feature.content_embedding = embedding
+    edges = build_candidate_edges(features, min_content_similarity=0.9)
+    assert [edge.edge_type for edge in edges] == ["content_similarity"]
+    assert 0.94 < edges[0].score < 0.96
+
+    def _run(threshold: float) -> list[int]:
+        config = Config()
+        config.candidate_generation.component_min_edge_score = threshold
+        result = cluster_canonical_documents(
+            embeddings,
+            config=config,
+            options=PipelineOptions(cluster_mode="graph"),
+            item_names=[path.name for path in paths],
+            canonical_document_features=features,
+            candidate_edges=edges,
+            candidate_components=[],
+            cluster_documents_fn=_all_noise_cluster_fn,
+        )
+        return result.labels.tolist()
+
+    assert _run(0.9) == [0, 0]
+    assert _run(0.97) == [-1, -1]
