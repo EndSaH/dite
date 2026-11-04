@@ -632,3 +632,92 @@ def test_organize_preview_execute_handles_partial_copy_failure(
     assert not preview.operations[1].destination.exists()
     assert not ok_file.exists()
     assert bad_file.exists()
+
+
+def _organize_with_journal(tmp_path: Path):
+    from dite.flow.move import JOURNAL_DIR_NAME
+
+    source_folder = tmp_path / "src"
+    (source_folder / "sub").mkdir(parents=True)
+    files = [source_folder / "a.txt", source_folder / "sub" / "b.txt"]
+    for index, path in enumerate(files):
+        path.write_text(f"payload {index}", encoding="utf-8")
+    target_folder = tmp_path / "out"
+    preview = OrganizePreview(source_folder=source_folder, target_folder=target_folder)
+    preview.add_cluster("Reports", files)
+    success, failed = preview.execute(
+        dry_run=False, journal_dir=target_folder / JOURNAL_DIR_NAME
+    )
+    assert (success, failed) == (2, 0)
+    return preview, files
+
+
+def test_execute_writes_journal_and_undo_restores_files(tmp_path: Path) -> None:
+    from dite.flow.move import find_latest_journal, read_journal, undo_journal
+
+    preview, files = _organize_with_journal(tmp_path)
+    assert preview.journal_path is not None
+    assert find_latest_journal(preview.target_folder) == preview.journal_path
+    contents = read_journal(preview.journal_path)
+    assert [source for source, _ in contents.moves] == files
+    assert not any(path.exists() for path in files)
+
+    result = undo_journal(preview.journal_path)
+
+    assert len(result.restored) == 2
+    assert result.skipped == []
+    for index, path in enumerate(files):
+        assert path.read_text(encoding="utf-8") == f"payload {index}"
+    # The cluster folder the run created is gone; the journal is kept.
+    assert not (preview.target_folder / "Reports").exists()
+    assert preview.journal_path.exists()
+    assert read_journal(preview.journal_path).undone is True
+    assert find_latest_journal(preview.target_folder) is None
+    with pytest.raises(ValueError, match="already undone"):
+        undo_journal(preview.journal_path)
+
+
+def test_undo_never_overwrites_and_reports_missing_files(tmp_path: Path) -> None:
+    from dite.flow.move import undo_journal
+
+    preview, files = _organize_with_journal(tmp_path)
+    moved_a, moved_b = (op.destination for op in preview.operations)
+    files[0].write_text("new file at the old path", encoding="utf-8")
+    moved_b.unlink()
+
+    plan = undo_journal(preview.journal_path, dry_run=True)
+    assert plan.restored == []
+    assert sorted(reason for _, reason in plan.skipped) == ["conflict", "missing"]
+    assert moved_a.exists()
+
+    undo_journal(preview.journal_path)
+
+    assert files[0].read_text(encoding="utf-8") == "new file at the old path"
+    assert moved_a.read_text(encoding="utf-8") == "payload 0"
+    # A non-empty cluster folder is left in place.
+    assert (preview.target_folder / "Reports").exists()
+
+
+def test_undo_round_trips_non_utf8_and_special_names(tmp_path: Path) -> None:
+    import os
+
+    from dite.flow.move import JOURNAL_DIR_NAME, undo_journal
+
+    source_folder = tmp_path / "src"
+    source_folder.mkdir()
+    names = ["报告 [草稿] $(x).txt", "it's.txt"]
+    if os.name == "posix":
+        names.append(os.fsdecode(b"latin1-\xe9.txt"))
+    files = []
+    for name in names:
+        path = source_folder / name
+        path.write_text(name, encoding="utf-8", errors="surrogateescape")
+        files.append(path)
+    preview = OrganizePreview(source_folder=source_folder, target_folder=tmp_path / "o")
+    preview.add_cluster("Mixed", files)
+    preview.execute(dry_run=False, journal_dir=tmp_path / "o" / JOURNAL_DIR_NAME)
+
+    result = undo_journal(preview.journal_path)
+
+    assert len(result.restored) == len(files)
+    assert all(path.exists() for path in files)

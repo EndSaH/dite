@@ -11,6 +11,7 @@ DITE 是一个面向本地文件夹的 CLI 文档聚类工具。它会扫描目�
 - `dite scan`
 - `dite pdf-check`
 - `dite organize`
+- `dite undo`
 - `dite cache status`
 - `dite cache clear`
 - `dite cache clear-vlm`
@@ -43,7 +44,6 @@ DITE 是一个面向本地文件夹的 CLI 文档聚类工具。它会扫描目�
 
 当前代码库没有实现这些能力：
 
-- 执行后的整理回滚或撤销
 - Watch 模式
 - 用户反馈闭环
 - HTML 报告生成

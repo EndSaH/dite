@@ -816,6 +816,85 @@ def organize(
     )
 
 
+@app.command(help=_help_key("undo_description"))
+def undo(
+    path: Annotated[
+        Path,
+        typer.Argument(help=_help_key("cli_help_undo_path")),
+    ],
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help=_help_key("cli_help_undo_dry_run")),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help=_help_key("cli_help_yes")),
+    ] = False,
+):
+    """Undo the file moves recorded by organize/assign --execute."""
+    from rich.markup import escape
+
+    from dite.flow.move import find_latest_journal, read_journal, undo_journal
+
+    logger = get_logger()
+    journal_path = path if path.is_file() else find_latest_journal(path)
+    if journal_path is None:
+        logger.error(t("undo_no_journal", path=escape(str(path))))
+        raise typer.Exit(1)
+    try:
+        contents = read_journal(journal_path)
+    except (OSError, ValueError) as exc:
+        logger.error(
+            f"{t('undo_no_journal', path=escape(str(journal_path)))} "
+            f"({escape(str(exc))})"
+        )
+        raise typer.Exit(1) from exc
+    if contents.undone:
+        logger.error(t("undo_already_done", path=escape(str(journal_path))))
+        raise typer.Exit(1)
+
+    plan = undo_journal(journal_path, dry_run=True)
+    logger.print(
+        t(
+            "undo_preview",
+            count=len(plan.restored),
+            path=escape(str(journal_path)),
+        )
+    )
+    for destination, source in plan.restored[:10]:
+        logger.print(f"  {escape(str(destination))} -> {escape(str(source))}")
+    if len(plan.restored) > 10:
+        logger.print(t("organize_more_files", count=len(plan.restored) - 10))
+    _print_undo_skips(logger, plan.skipped)
+    if dry_run:
+        return
+    if not plan.restored:
+        logger.success(t("undo_done", restored=0, skipped=len(plan.skipped)))
+        return
+    if not yes and not typer.confirm(t("undo_confirm")):
+        logger.print(t("organize_cancelled"))
+        return
+
+    result = undo_journal(journal_path)
+    _print_undo_skips(logger, result.skipped)
+    logger.success(
+        t("undo_done", restored=len(result.restored), skipped=len(result.skipped))
+    )
+
+
+def _print_undo_skips(logger, skipped: list[tuple[Path, str]]) -> None:
+    from rich.markup import escape
+
+    for skipped_path, reason in skipped:
+        shown = escape(str(skipped_path))
+        if reason == "missing":
+            logger.warning(t("undo_skipped_missing", path=shown))
+        elif reason == "conflict":
+            logger.warning(t("undo_skipped_conflict", path=shown))
+        else:
+            logger.warning(f"{shown}: {escape(reason)}")
+
+
 @cache_app.command("clear", help=_help_key("cli_help_cache_clear"))
 def cache_clear(ctx: typer.Context):
     """Clear all cache."""

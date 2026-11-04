@@ -121,6 +121,18 @@ class Messages:
     organize_script_hint: str
     organize_confirm: str
     organize_done: str
+    organize_journal_written: str
+    undo_description: str
+    cli_help_undo_path: str
+    cli_help_yes: str
+    cli_help_undo_dry_run: str
+    undo_no_journal: str
+    undo_already_done: str
+    undo_preview: str
+    undo_confirm: str
+    undo_done: str
+    undo_skipped_missing: str
+    undo_skipped_conflict: str
     organize_cancelled: str
     organize_dry_run_hint: str
     organize_script_header: str
@@ -408,6 +420,20 @@ ZH_CN = Messages(
     organize_script_hint="请检查脚本内容后执行: chmod +x && ./organize.sh",
     organize_confirm="确认执行文件移动?",
     organize_done="完成: {success} 个文件已移动, {failed} 个失败",
+    organize_journal_written="移动记录已写入: {path}（撤销: dite undo {target}）",
+    undo_description="撤销一次 organize/assign --execute 的文件移动",
+    cli_help_undo_path=(
+        "移动记录文件，或目标文件夹（使用其 .dite/ 下最新一份未撤销的记录）"
+    ),
+    cli_help_yes="不再询问确认",
+    cli_help_undo_dry_run="只预览要移回的文件，不实际移动",
+    undo_no_journal="找不到可撤销的移动记录: {path}",
+    undo_already_done="这份记录已经撤销过: {path}",
+    undo_preview="将把 {count} 个文件移回原位（记录: {path}）",
+    undo_confirm="确认撤销这些移动?",
+    undo_done="撤销完成: {restored} 个已移回, {skipped} 个跳过",
+    undo_skipped_missing="跳过（整理后的文件已不存在）: {path}",
+    undo_skipped_conflict="跳过（原位置已有同名文件）: {path}",
     organize_cancelled="已取消",
     organize_dry_run_hint=(
         "这是预览模式。使用 --execute 执行或 --output-script 生成脚本。"
@@ -774,6 +800,25 @@ EN = Messages(
     organize_script_hint="Review the script and run: chmod +x && ./organize.sh",
     organize_confirm="Confirm file move?",
     organize_done="Done: {success} files moved, {failed} failed",
+    organize_journal_written=(
+        "Move journal written: {path} (undo with: dite undo {target})"
+    ),
+    undo_description="Undo the file moves of an organize/assign --execute run",
+    cli_help_undo_path=(
+        "Journal file, or a target folder (uses its latest journal in .dite/ "
+        "that is not undone yet)"
+    ),
+    cli_help_yes="Do not ask for confirmation",
+    cli_help_undo_dry_run="Only list the files that would be moved back",
+    undo_no_journal="No move journal to undo at: {path}",
+    undo_already_done="This journal was already undone: {path}",
+    undo_preview="{count} files will be moved back (journal: {path})",
+    undo_confirm="Undo these moves?",
+    undo_done="Undo finished: {restored} restored, {skipped} skipped",
+    undo_skipped_missing="Skipped (the moved file no longer exists): {path}",
+    undo_skipped_conflict=(
+        "Skipped (a file already exists at the original location): {path}"
+    ),
     organize_cancelled="Cancelled",
     organize_dry_run_hint=(
         "This is preview mode. Use --execute to run or --output-script to "

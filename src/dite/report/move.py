@@ -52,8 +52,24 @@ def finalize_organize_run(
         logger.print("\n")
         confirm = __import__("typer").confirm(t("organize_confirm"))
         if confirm:
-            success, failed = preview.execute(dry_run=False)
+            from dite.flow.move import JOURNAL_DIR_NAME
+
+            success, failed = preview.execute(
+                dry_run=False,
+                journal_dir=preview.target_folder / JOURNAL_DIR_NAME,
+            )
             logger.success(t("organize_done", success=success, failed=failed))
+            journal_path = getattr(preview, "journal_path", None)
+            if journal_path is not None and success:
+                from rich.markup import escape
+
+                logger.print(
+                    t(
+                        "organize_journal_written",
+                        path=escape(str(journal_path)),
+                        target=escape(str(preview.target_folder)),
+                    )
+                )
         else:
             logger.print(t("organize_cancelled"))
         return

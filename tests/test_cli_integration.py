@@ -1239,3 +1239,51 @@ def test_pdf_check_verbose_uses_human_labels_not_internal_codes(
     assert "VLM sampling" in details_output
     assert "parser_timeout_or_broken" not in details_output
     assert "vlm_api" not in details_output
+
+
+def test_organize_execute_then_undo_cli_restores_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    first = docs / "first.txt"
+    second = docs / "second.txt"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    target = tmp_path / "organized"
+
+    _write_test_config(tmp_path, monkeypatch)
+    runner = CliRunner()
+
+    def fake_run(self, folder: Path, options):
+        return PipelineResult(
+            files=[first, second],
+            contents=["first", "second"],
+            embeddings=np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+            labels=np.array([0, 0], dtype=int),
+            cluster_names={0: "Notes"},
+        )
+
+    monkeypatch.setattr("dite.flow.api.PipelineService.run", fake_run)
+
+    organized = runner.invoke(
+        app,
+        ["organize", str(docs), "--target", str(target), "--execute"],
+        input="y\n",
+    )
+    assert organized.exit_code == 0, organized.output
+    assert not first.exists()
+    assert "dite undo" in organized.output
+
+    preview = runner.invoke(app, ["undo", str(target), "--dry-run"])
+    assert preview.exit_code == 0, preview.output
+    assert not first.exists()
+
+    undone = runner.invoke(app, ["undo", str(target), "--yes"])
+    assert undone.exit_code == 0, undone.output
+    assert first.read_text(encoding="utf-8") == "first"
+    assert second.read_text(encoding="utf-8") == "second"
+    assert not (target / "Notes").exists()
+
+    again = runner.invoke(app, ["undo", str(target), "--yes"])
+    assert again.exit_code == 1
