@@ -43,12 +43,24 @@ class ChatCompletionProfileConfig:
     thinking_budget: int | None = None
 
 
+def _json_task_profile() -> ChatCompletionProfileConfig:
+    # JSON answers with a free-text reason do not fit in the 50-token naming
+    # budget; a truncated object fails to parse and silently falls back.
+    return ChatCompletionProfileConfig(max_tokens=300)
+
+
 @dataclass
 class RequestProfilesConfig:
     """Task-specific request profiles."""
 
     cluster_naming: ChatCompletionProfileConfig = field(
         default_factory=ChatCompletionProfileConfig
+    )
+    cluster_adjudication: ChatCompletionProfileConfig = field(
+        default_factory=_json_task_profile
+    )
+    cluster_representation: ChatCompletionProfileConfig = field(
+        default_factory=_json_task_profile
     )
 
 
@@ -268,14 +280,27 @@ def _dict_to_config(data: dict[str, Any]) -> Config:
 
     if "request_profiles" in data:
         request_profiles_data = data["request_profiles"].copy()
-        if "cluster_naming" in request_profiles_data:
-            cluster_naming_data = request_profiles_data["cluster_naming"].copy()
-            if "reasoning_mode" in cluster_naming_data:
-                cluster_naming_data["reasoning_mode"] = _normalize_reasoning_mode(
-                    cluster_naming_data["reasoning_mode"]
+        defaults = RequestProfilesConfig()
+        for profile_name, profile_data in list(request_profiles_data.items()):
+            if not isinstance(profile_data, dict):
+                continue
+            profile_values = profile_data.copy()
+            if "reasoning_mode" in profile_values:
+                profile_values["reasoning_mode"] = _normalize_reasoning_mode(
+                    profile_values["reasoning_mode"]
                 )
-            request_profiles_data["cluster_naming"] = ChatCompletionProfileConfig(
-                **cluster_naming_data
+            default_profile = getattr(defaults, profile_name, None)
+            if isinstance(default_profile, ChatCompletionProfileConfig):
+                # Unspecified keys keep the task's own default, not the
+                # naming profile's 50-token budget.
+                profile_values = {
+                    "max_tokens": default_profile.max_tokens,
+                    "reasoning_mode": default_profile.reasoning_mode,
+                    "thinking_budget": default_profile.thinking_budget,
+                    **profile_values,
+                }
+            request_profiles_data[profile_name] = ChatCompletionProfileConfig(
+                **profile_values
             )
         config.request_profiles = RequestProfilesConfig(**request_profiles_data)
 

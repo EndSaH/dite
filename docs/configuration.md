@@ -75,11 +75,15 @@ YAML 中的字符串值支持环境变量展开。
 
 ## `request_profiles`
 
-当前实际实现的请求配置只有：
+当前实际实现的请求配置有：
 
-- `cluster_naming`
+- `cluster_naming`：簇命名，默认 `max_tokens: 50`
+- `cluster_adjudication`：可选的 LLM 边裁决（`cluster_adjudication.enable_llm_judging`），默认 `max_tokens: 300`
+- `cluster_representation`：可选的 LLM 簇表示（`cluster_representation.mode: llm_enhanced`），默认 `max_tokens: 300`
 
-`cluster_naming` 下的字段包括：
+后两个任务要求模型返回带理由的 JSON，50 个 token 装不下，截断的 JSON 会解析失败并静默回退，所以它们有独立的预算。配置文件里只写了部分字段时，没写的字段沿用该任务自己的默认值。
+
+每个请求配置下的字段都是：
 
 - `max_tokens`
 - `reasoning_mode`

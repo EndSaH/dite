@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import json
+import re
 
 from openai import OpenAI
 
 from dite.app.config import Config
+from dite.app.i18n import get_locale
 from dite.cluster.model import (
     CONTENT_BACKED_EDGE_TYPES,
     AdjudicationDecision,
@@ -14,11 +15,18 @@ from dite.cluster.model import (
     CandidateComponent,
     CandidateEdge,
 )
+from dite.doc import DocumentFeatures
+from dite.doc.build import filename_title, strip_markup
 from dite.util.api import ChatCompletionRequest
-from dite.util.llm import build_chat_completion_kwargs
+from dite.util.llm import (
+    build_chat_completion_kwargs,
+    parse_json_bool,
+    parse_json_object,
+)
 
 DEFAULT_REQUEST_SCORE_THRESHOLD = 0.85
 DEFAULT_EDGE_MERGE_THRESHOLD = 0.92
+_ADJUDICATION_EXCERPT_CHARS = 600
 
 
 def build_adjudication_requests(
@@ -126,8 +134,15 @@ def apply_llm_adjudication(
     client: OpenAI,
     config: Config,
     request_runtime,
+    document_features: list[DocumentFeatures] | None = None,
 ) -> list[AdjudicationDecision]:
-    """Apply optional LLM adjudication for review-only edge requests."""
+    """Apply optional LLM adjudication for edge review requests.
+
+    The prompt carries each document's title, summary, keywords and a content
+    excerpt from ``document_features``; without content the model could only
+    guess from file paths.
+    """
+    feature_by_id = {feature.file_id: feature for feature in (document_features or [])}
     llm_requests: list[ChatCompletionRequest] = []
     request_index: list[AdjudicationRequest] = []
     for request in requests:
@@ -141,10 +156,10 @@ def apply_llm_adjudication(
                     messages=[
                         {
                             "role": "user",
-                            "content": _adjudication_prompt(request),
+                            "content": _adjudication_prompt(request, feature_by_id),
                         }
                     ],
-                    profile=config.request_profiles.cluster_naming,
+                    profile=config.request_profiles.cluster_adjudication,
                     response_format={"type": "json_object"},
                 )
             )
@@ -198,27 +213,73 @@ def apply_llm_adjudication(
     return decisions
 
 
-def _adjudication_prompt(request: AdjudicationRequest) -> str:
+def _describe_subject(
+    label: str,
+    subject_id: str,
+    feature: DocumentFeatures | None,
+) -> str:
+    if feature is None:
+        return f"Document {label}: {subject_id}\n(no extracted content available)"
+    stem_title = filename_title(feature.stem)
+    content_titles = [
+        title for title in feature.title_candidates if title != stem_title
+    ]
+    excerpt = re.sub(r"\s+", " ", strip_markup(feature.content_text)).strip()
+    lines = [
+        f"Document {label}",
+        f"File: {feature.name}",
+        f"Folder: {feature.path.parent.as_posix() or '.'}",
+        f"Title: {content_titles[0] if content_titles else '-'}",
+    ]
+    if feature.summary and feature.summary not in content_titles:
+        lines.append(f"Summary: {feature.summary}")
+    if feature.keywords:
+        lines.append(f"Keywords: {', '.join(feature.keywords[:8])}")
+    if feature.quality_flags.filename_dominant:
+        lines.append("Note: text extraction failed; only the file name is known.")
+    lines.append(f"Excerpt: {excerpt[:_ADJUDICATION_EXCERPT_CHARS] or '(empty)'}")
+    return "\n".join(lines)
+
+
+def _adjudication_prompt(
+    request: AdjudicationRequest,
+    feature_by_id: dict[str, DocumentFeatures] | None = None,
+) -> str:
+    feature_by_id = feature_by_id or {}
     evidence = "\n".join(f"- {item}" for item in request.evidence_bundle) or "-"
     quality_guard = ", ".join(request.quality_guard) or "-"
     score = "-" if request.score is None else f"{request.score:.3f}"
+    subjects = "\n\n".join(
+        _describe_subject(label, subject_id, feature_by_id.get(subject_id))
+        for label, subject_id in zip("ABCDEFGH", request.subjects, strict=False)
+    )
+    reason_language = (
+        "Write the reason in Simplified Chinese."
+        if get_locale() == "zh-CN"
+        else "Write the reason in English."
+    )
     return (
-        "Return strict JSON with keys should_merge, confidence, reason.\n"
-        f"Request type: {request.request_type}\n"
-        f"Trigger: {request.trigger_reason}\n"
-        f"Score: {score}\n"
+        "You are helping organize a folder of files into topical subfolders.\n"
+        "Decide whether the documents below belong in the same subfolder.\n"
+        "Answer should_merge=true only when they share a specific subject: the "
+        "same project, course, topic, or document family. A shared file name, "
+        "a generic heading, the same file format, or only a broad domain is "
+        "not enough.\n"
+        "Return strict JSON with keys should_merge (boolean), confidence "
+        "(number from 0 to 1) and reason (one short sentence). "
+        f"{reason_language}\n\n"
+        f"Candidate signal: {request.trigger_reason} (score {score})\n"
         f"Quality guard: {quality_guard}\n"
-        f"Subjects: {', '.join(request.subjects)}\n"
-        f"Evidence:\n{evidence}\n"
+        f"Evidence:\n{evidence}\n\n"
+        f"{subjects}\n"
     )
 
 
 def _parse_llm_adjudication(content: str) -> dict[str, object] | None:
-    try:
-        payload = json.loads(content)
-    except json.JSONDecodeError:
+    payload = parse_json_object(content)
+    if payload is None or "should_merge" not in payload:
         return None
-    should_merge = bool(payload.get("should_merge"))
+    should_merge = parse_json_bool(payload.get("should_merge"))
     confidence_raw = payload.get("confidence", 0.5)
     try:
         confidence = float(confidence_raw)

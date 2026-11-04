@@ -427,6 +427,7 @@ def build_canonical_cluster_stage(
             client=client,
             config=config,
             request_runtime=request_runtime,
+            document_features=canonical_document_features,
         )
         decisions_by_request = {
             decision.request_id: decision for decision in adjudication_decisions

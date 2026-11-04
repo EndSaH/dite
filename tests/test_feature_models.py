@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
+from dite.app.config import Config
 from dite.cluster import (
     AdjudicationDecision,
     AdjudicationRequest,
@@ -25,7 +26,7 @@ from dite.doc import (
     QualityFlags,
     build_document_features,
 )
-from dite.app.config import Config
+
 
 def test_document_features_defaults_and_top_level_proxies() -> None:
     features = DocumentFeatures(
@@ -139,7 +140,7 @@ def test_build_document_features_uses_file_report_and_generates_tokens() -> None
     assert "quarterly" in features.topic
 
 
-def test_build_document_features_marks_filename_only_text_as_filename_dominant() -> None:
+def test_filename_only_text_is_flagged_filename_dominant() -> None:
     features = build_document_features(Path("scans/scan.pdf"), "  p.1  ")
 
     assert features.quality_flags.filename_dominant is True
@@ -512,6 +513,145 @@ def test_apply_llm_adjudication_can_override_review_edges() -> None:
     assert decisions[0].decision == "merge_edge"
     assert decisions[0].model_used == "llm"
     assert decisions[0].fallback_used is False
+
+
+class _RecordingRuntime:
+    def __init__(self, contents: list[str]) -> None:
+        self.contents = contents
+        self.batches: list[list] = []
+
+    def run_cluster_naming_batch(self, requests):
+        self.batches.append(list(requests))
+        return [
+            type("_Result", (), {"content": content, "error": None})()
+            for content in self.contents[: len(requests)]
+        ]
+
+
+class _FakeClient:
+    base_url = "https://api.example.com/v1"
+
+
+def test_llm_adjudication_prompt_includes_document_content() -> None:
+    features = [
+        build_document_features(
+            Path("courseA/lecture1.pdf"),
+            "Operating Systems\nProcesses, threads and CPU scheduling policies.",
+        ),
+        build_document_features(
+            Path("courseB/lecture1.pdf"),
+            "Organic Chemistry\nAlkanes, alkenes and reaction mechanisms.",
+        ),
+    ]
+    request = AdjudicationRequest(
+        request_id="edge:a->b",
+        request_type="edge_review",
+        subjects=[features[0].file_id, features[1].file_id],
+        evidence_bundle=["filename_token_overlap:['lecture1']"],
+        trigger_reason="filename_similarity",
+        score=1.0,
+    )
+    runtime = _RecordingRuntime(
+        ['{"should_merge": false, "confidence": 0.9, "reason": "different"}']
+    )
+
+    decisions = apply_llm_adjudication(
+        [request],
+        client=_FakeClient(),
+        config=Config(),
+        request_runtime=runtime,
+        document_features=features,
+    )
+
+    kwargs = runtime.batches[0][0].kwargs
+    prompt = kwargs["messages"][0]["content"]
+    assert "Operating Systems" in prompt
+    assert "CPU scheduling" in prompt
+    assert "Organic Chemistry" in prompt
+    assert "Folder: courseA" in prompt
+    profiles = Config().request_profiles
+    assert kwargs["max_tokens"] == profiles.cluster_adjudication.max_tokens
+    assert kwargs["max_tokens"] > profiles.cluster_naming.max_tokens
+    assert decisions[0].decision == "review_edge"
+
+
+def test_llm_adjudication_reads_string_false_and_fenced_json() -> None:
+    request = AdjudicationRequest(
+        request_id="edge:a->b",
+        request_type="edge_review",
+        subjects=["a", "b"],
+        trigger_reason="content_similarity",
+        score=0.9,
+    )
+    for content, expected in [
+        ('{"should_merge": "false", "confidence": 0.8, "reason": "no"}', "review_edge"),
+        (
+            '```json\n{"should_merge": true, "confidence": 0.8, "reason": "yes"}\n```',
+            "merge_edge",
+        ),
+        ('Sure! {"should_merge": "yes", "confidence": "0.7"}', "merge_edge"),
+    ]:
+        decisions = apply_llm_adjudication(
+            [request],
+            client=_FakeClient(),
+            config=Config(),
+            request_runtime=_RecordingRuntime([content]),
+        )
+        assert decisions[0].decision == expected
+        assert decisions[0].fallback_used is False
+
+
+def test_llm_cluster_representations_are_batched_and_use_central_members() -> None:
+    def _feature(file_id: str, embedding: list[float], content: str):
+        return DocumentFeatures(
+            file_id=file_id,
+            path=Path(file_id),
+            name=Path(file_id).name,
+            stem=Path(file_id).stem,
+            extension=".txt",
+            content_text=content,
+            summary=content.split("\n")[0],
+            content_embedding=np.array(embedding, dtype=np.float32),
+        )
+
+    features = [
+        _feature("a/outlier.txt", [0.0, 1.0], "Outlier note"),
+        _feature("a/core-1.txt", [1.0, 0.1], "Matrix rank\nRank-nullity theorem."),
+        _feature("a/core-2.txt", [1.0, 0.0], "Eigenvalues\nCharacteristic polynomial."),
+        _feature("b/budget.txt", [0.0, 1.0], "Budget 2026\nMonthly spending."),
+    ]
+    runtime = _RecordingRuntime(
+        [
+            '{"summary": "Linear algebra notes", "topic": "linear algebra", '
+            '"domain": "education", "keywords": ["matrix"], '
+            '"evidence_summary": "shared algebra topics"}',
+            '{"summary": "Household budget", "topic": "budget", '
+            '"domain": "finance", "keywords": "budget, spending", '
+            '"evidence_summary": "money"}',
+        ]
+    )
+    config = Config()
+    config.cluster_representation.mode = "llm_enhanced"
+
+    representations = build_cluster_representations(
+        labels=np.array([0, 0, 0, 1], dtype=int),
+        cluster_names={0: "Linear Algebra", 1: "Budget"},
+        document_features=features,
+        config=config,
+        client=_FakeClient(),
+        request_runtime=runtime,
+    )
+
+    assert len(runtime.batches) == 1
+    assert len(runtime.batches[0]) == 2
+    first_kwargs = runtime.batches[0][0].kwargs
+    assert first_kwargs["max_tokens"] == (
+        config.request_profiles.cluster_representation.max_tokens
+    )
+    assert "Rank-nullity theorem" in first_kwargs["messages"][0]["content"]
+    assert representations[0].representative_file_ids == ["a/core-1.txt"]
+    assert representations[0].summary == "Linear algebra notes"
+    assert representations[1].keywords == ["budget", "spending"]
 
 
 def test_cluster_representation_defaults() -> None:

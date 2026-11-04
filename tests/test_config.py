@@ -127,6 +127,37 @@ def test_load_config_reads_cluster_naming_request_profile(
     assert cfg.request_profiles.cluster_naming.max_tokens == 64
     assert cfg.request_profiles.cluster_naming.reasoning_mode == "off"
     assert cfg.request_profiles.cluster_naming.thinking_budget == 256
+    # Profiles not mentioned in the file keep their own JSON-sized defaults.
+    assert cfg.request_profiles.cluster_adjudication.max_tokens == 300
+    assert cfg.request_profiles.cluster_representation.max_tokens == 300
+
+
+def test_load_config_partial_json_profile_keeps_task_default_budget(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    global_config_path = tmp_path / ".config" / "dite" / "config.yaml"
+    global_config_path.parent.mkdir(parents=True, exist_ok=True)
+    global_config_path.write_text(
+        "\n".join(
+            [
+                "request_profiles:",
+                "  cluster_adjudication:",
+                "    reasoning_mode: off",
+                "  cluster_representation:",
+                "    max_tokens: 512",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = load_config()
+
+    assert cfg.request_profiles.cluster_adjudication.max_tokens == 300
+    assert cfg.request_profiles.cluster_adjudication.reasoning_mode == "off"
+    assert cfg.request_profiles.cluster_representation.max_tokens == 512
+    assert cfg.request_profiles.cluster_naming.max_tokens == 50
 
 
 def test_load_config_reads_cluster_naming_workers(tmp_path: Path, monkeypatch) -> None:

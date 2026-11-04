@@ -1,5 +1,6 @@
 """LLM request helpers."""
 
+import json
 from typing import Any
 
 from openai import APIError, AsyncOpenAI, OpenAI
@@ -102,3 +103,37 @@ def should_retry_api_error(exc: APIError) -> bool:
     if status_code >= 500:
         return True
     return error_code in {50507}
+
+
+def parse_json_object(content: str) -> dict[str, Any] | None:
+    """Parse a JSON object from a model reply, tolerating code fences and prose.
+
+    Returns ``None`` when no JSON object can be recovered.
+    """
+    text = (content or "").strip()
+    if not text:
+        return None
+    candidates = [text]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(text[start : end + 1])
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def parse_json_bool(value: Any) -> bool:
+    """Read a model-provided boolean; the string ``"false"`` means False."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().casefold() in {"true", "yes", "y", "1", "是"}
+    return False

@@ -26,6 +26,12 @@ request_profiles:
     max_tokens: 50
     reasoning_mode: "off"              # default / off / on
     thinking_budget: null
+  cluster_adjudication:                # JSON answers need a larger budget
+    max_tokens: 300
+    reasoning_mode: "off"
+  cluster_representation:
+    max_tokens: 300
+    reasoning_mode: "off"
 
 # Clustering Parameters
 clustering:
