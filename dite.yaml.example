@@ -70,10 +70,14 @@ candidate_generation:
 
 # Topic clustering controls
 topic_clustering:
-  mode: density                        # density / graph
-  reducer: none                        # none / pca
+  mode: density                        # density / graph / agglomerative
+  reducer: none                        # none / pca / umap (density mode only; umap needs umap-learn)
   pca_components: null                 # Used only when reducer = pca
+  umap_components: 10                  # Used only when reducer = umap
+  umap_neighbors: 15                   # Used only when reducer = umap
   allow_single_cluster: false
+  agglomerative_target_clusters: null  # agglomerative: desired folder count
+  agglomerative_distance_threshold: null  # agglomerative: cosine distance cut; both null = auto (silhouette)
 
 # Optional LLM-assisted boundary adjudication
 cluster_adjudication:

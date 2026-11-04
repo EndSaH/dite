@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import yaml
 
 from dite.app.config import load_config
@@ -273,6 +274,60 @@ def test_load_config_reads_v2_clustering_domains(
     assert cfg.cluster_adjudication.edge_merge_threshold == 0.95
     assert cfg.cluster_adjudication.request_score_threshold == 0.9
     assert cfg.cluster_representation.mode == "llm_enhanced"
+
+
+def test_load_config_reads_agglomerative_and_umap_settings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    global_config_path = tmp_path / ".config" / "dite" / "config.yaml"
+    global_config_path.parent.mkdir(parents=True, exist_ok=True)
+    global_config_path.write_text(
+        "\n".join(
+            [
+                "topic_clustering:",
+                "  mode: agglomerative",
+                "  reducer: umap",
+                "  umap_components: 8",
+                "  umap_neighbors: 12",
+                "  agglomerative_target_clusters: 12",
+                "  agglomerative_distance_threshold: 0.4",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = load_config()
+
+    assert cfg.topic_clustering.mode == "agglomerative"
+    assert cfg.topic_clustering.reducer == "umap"
+    assert cfg.topic_clustering.umap_components == 8
+    assert cfg.topic_clustering.umap_neighbors == 12
+    assert cfg.topic_clustering.agglomerative_target_clusters == 12
+    assert cfg.topic_clustering.agglomerative_distance_threshold == 0.4
+
+
+@pytest.mark.parametrize(
+    ("line", "message"),
+    [
+        ("  mode: agglomarative", "topic_clustering.mode"),
+        ("  reducer: tsne", "topic_clustering.reducer"),
+    ],
+)
+def test_load_config_rejects_unknown_topic_clustering_values(
+    tmp_path: Path, monkeypatch, line: str, message: str
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    global_config_path = tmp_path / ".config" / "dite" / "config.yaml"
+    global_config_path.parent.mkdir(parents=True, exist_ok=True)
+    global_config_path.write_text(
+        "\n".join(["topic_clustering:", line]), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_config()
 
 
 def test_load_config_reads_api_runtime_fields(tmp_path: Path, monkeypatch) -> None:

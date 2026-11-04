@@ -8,13 +8,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from sklearn.decomposition import PCA
 
 from dite.app.config import Config
 from dite.cluster import (
     apply_llm_adjudication,
     apply_rule_adjudication,
     build_adjudication_requests,
+)
+from dite.cluster.algo import (
+    cluster_documents_agglomerative,
+    reduce_for_density_clustering,
 )
 from dite.cluster.link import build_candidate_components, build_candidate_edges
 from dite.cluster.model import (
@@ -313,26 +316,45 @@ def cluster_canonical_documents(
             ),
         )
 
-    cluster_inputs = embeddings
-    if pca_components_option is not None:
-        pca_components = min(
-            pca_components_option,
-            embeddings.shape[0],
-            embeddings.shape[1],
+    if cluster_mode == "agglomerative":
+        topic = config.topic_clustering
+        result = cluster_documents_agglomerative(
+            embeddings,
+            config=config,
+            clustering=config.clustering,
+            target_clusters=topic.agglomerative_target_clusters,
+            distance_threshold=topic.agglomerative_distance_threshold,
         )
-        if pca_components >= 1:
-            cluster_inputs = PCA(
-                n_components=pca_components,
-                random_state=0,
-            ).fit_transform(embeddings)
+        return apply_candidate_component_links(
+            result,
+            canonical_document_features,
+            candidate_components,
+        )
+
+    reducer = (
+        "pca"
+        if pca_components_option is not None
+        else (config.topic_clustering.reducer)
+    )
+    cluster_inputs = reduce_for_density_clustering(
+        embeddings,
+        reducer=reducer,
+        pca_components=pca_components_option,
+        umap_components=config.topic_clustering.umap_components,
+        umap_neighbors=config.topic_clustering.umap_neighbors,
+    )
+    cluster_kwargs: dict[str, Any] = {}
+    if cluster_inputs is not None:
+        cluster_kwargs["cluster_inputs"] = cluster_inputs
 
     result = cluster_documents_fn(
-        cluster_inputs,
+        embeddings,
         config=config,
         repair_noise=options.repair_noise,
         clustering=config.clustering,
         allow_single_cluster=allow_single_cluster,
         item_names=item_names,
+        **cluster_kwargs,
     )
     return apply_candidate_component_links(
         result,

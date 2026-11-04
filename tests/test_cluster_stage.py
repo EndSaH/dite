@@ -3,8 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from dite.app.config import Config
+from dite.cluster.algo import (
+    cluster_documents_agglomerative,
+    reduce_for_density_clustering,
+)
+from dite.cluster.api import cluster_documents
 from dite.cluster.link import build_candidate_edges
 from dite.cluster.model import ClusterMetrics, ClusterResult
 from dite.cluster.stage import cluster_canonical_documents
@@ -56,3 +62,177 @@ def test_graph_mode_does_not_turn_filename_matches_into_clusters() -> None:
     )
 
     assert result.labels.tolist() == [-1, -1, -1]
+
+
+def _separated_groups(
+    sizes: list[int],
+    *,
+    outliers: int = 0,
+    dim: int = 64,
+    seed: int = 0,
+    center_overlap: float = 0.0,
+) -> tuple[np.ndarray, list[int]]:
+    rng = np.random.default_rng(seed)
+    shared = rng.normal(size=dim)
+    shared /= np.linalg.norm(shared)
+    vectors = []
+    gold = []
+    for group, size in enumerate(sizes):
+        center = rng.normal(size=dim)
+        center /= np.linalg.norm(center)
+        center = (1 - center_overlap) * center + center_overlap * shared
+        center /= np.linalg.norm(center)
+        for _ in range(size):
+            vectors.append(center + 0.05 * rng.normal(size=dim))
+            gold.append(group)
+    for _ in range(outliers):
+        vectors.append(rng.normal(size=dim))
+        gold.append(-1)
+    return np.array(vectors, dtype=np.float32), gold
+
+
+def _same_partition(labels: list[int], gold: list[int]) -> bool:
+    pairs = set(zip(labels, gold, strict=True))
+    clustered = {(label, group) for label, group in pairs if group != -1}
+    return (
+        len({label for label, _ in clustered}) == len(clustered)
+        and len({group for _, group in clustered}) == len(clustered)
+        and all(label == -1 for label, group in pairs if group == -1)
+        and all(label != -1 for label, group in pairs if group != -1)
+    )
+
+
+def test_agglomerative_auto_cut_recovers_groups_and_keeps_outliers() -> None:
+    embeddings, gold = _separated_groups([6, 5, 4], outliers=3)
+
+    result = cluster_documents_agglomerative(embeddings, config=Config())
+
+    assert _same_partition(result.labels.tolist(), gold)
+    assert result.metrics.initial_clusters == 3
+    assert result.metrics.initial_noise == 3
+
+
+def test_agglomerative_target_counts_only_real_groups() -> None:
+    # Groups sit closer to each other than to the outliers, so a plain
+    # maxclust=3 cut would merge topics and keep outliers as "clusters".
+    # Outliers must not use up the folder budget.
+    embeddings, gold = _separated_groups(
+        [6, 5, 4], outliers=4, seed=1, center_overlap=0.6
+    )
+
+    result = cluster_documents_agglomerative(
+        embeddings, config=Config(), target_clusters=3
+    )
+
+    assert result.metrics.initial_clusters == 3
+    assert _same_partition(result.labels.tolist(), gold)
+
+
+def test_agglomerative_distance_threshold_and_size_floor() -> None:
+    embeddings, _gold = _separated_groups([5, 2])
+    config = Config()
+    config.clustering.min_cluster_size = 3
+
+    loose = cluster_documents_agglomerative(
+        embeddings, config=config, distance_threshold=1.9
+    )
+    tight = cluster_documents_agglomerative(
+        embeddings, config=config, distance_threshold=0.2
+    )
+
+    assert set(loose.labels.tolist()) == {0}
+    # The 2-member group is below min_cluster_size and stays unsorted.
+    assert tight.labels.tolist() == [0, 0, 0, 0, 0, -1, -1]
+
+
+def test_agglomerative_handles_tiny_inputs_and_zero_vectors() -> None:
+    tiny = cluster_documents_agglomerative(np.eye(2, dtype=np.float32), config=Config())
+    assert tiny.labels.tolist() == [-1, -1]
+
+    embeddings, _gold = _separated_groups([4, 4])
+    embeddings = np.vstack([embeddings, np.zeros((1, embeddings.shape[1]))])
+    result = cluster_documents_agglomerative(embeddings, config=Config())
+    assert result.labels.shape == (9,)
+    assert result.labels[-1] == -1
+
+
+def _stage_features(count: int):
+    return [
+        build_document_features(Path(f"docs/file-{index}.md"), f"Body {index}")
+        for index in range(count)
+    ]
+
+
+def test_stage_dispatches_agglomerative_mode_without_hdbscan() -> None:
+    embeddings, gold = _separated_groups([4, 4])
+    features = _stage_features(len(gold))
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("density clustering must not run")
+
+    result = cluster_canonical_documents(
+        embeddings,
+        config=Config(),
+        options=PipelineOptions(cluster_mode="agglomerative"),
+        item_names=[feature.name for feature in features],
+        canonical_document_features=features,
+        candidate_edges=[],
+        candidate_components=[],
+        cluster_documents_fn=_unexpected,
+    )
+
+    assert _same_partition(result.labels.tolist(), gold)
+
+
+def test_pca_reducer_clusters_reduced_inputs_but_keeps_original_embeddings() -> None:
+    embeddings, gold = _separated_groups([4, 4], dim=32)
+    features = _stage_features(len(gold))
+    seen = {}
+
+    def _record(embeddings_arg, **kwargs):
+        seen["embeddings"] = embeddings_arg
+        seen["cluster_inputs"] = kwargs.get("cluster_inputs")
+        return _all_noise_cluster_fn(embeddings_arg)
+
+    config = Config()
+    config.topic_clustering.reducer = "pca"
+    config.topic_clustering.pca_components = 3
+    cluster_canonical_documents(
+        embeddings,
+        config=config,
+        options=PipelineOptions(),
+        item_names=[feature.name for feature in features],
+        canonical_document_features=features,
+        candidate_edges=[],
+        candidate_components=[],
+        cluster_documents_fn=_record,
+    )
+
+    assert seen["embeddings"].shape == (8, 32)
+    assert seen["cluster_inputs"].shape == (8, 3)
+
+
+def test_umap_reducer_produces_low_dimensional_inputs() -> None:
+    pytest.importorskip("umap")
+    embeddings, _gold = _separated_groups([8, 8], dim=32)
+
+    reduced = reduce_for_density_clustering(
+        embeddings, reducer="umap", umap_components=4, umap_neighbors=5
+    )
+
+    assert reduced.shape == (16, 4)
+
+
+def test_cluster_documents_runs_hdbscan_on_cluster_inputs() -> None:
+    embeddings, gold = _separated_groups([5, 5, 5], dim=16)
+
+    result = cluster_documents(
+        np.zeros_like(embeddings) + 1.0,
+        config=Config(),
+        repair_noise=False,
+        cluster_inputs=embeddings,
+    )
+
+    assert _same_partition(result.labels.tolist(), gold)
+    with pytest.raises(ValueError, match="one row per embedding"):
+        cluster_documents(embeddings, config=Config(), cluster_inputs=embeddings[:3])

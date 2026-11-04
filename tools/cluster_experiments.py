@@ -341,7 +341,62 @@ def _extended_sweep_configs(base: Config) -> list[tuple[str, Config, PipelineOpt
                             )
                             runs.append((f"extended-{run_id:03d}", config, options))
                             run_id += 1
+    for input_mode in ("with_filename", "content_only"):
+        for topic in _alternative_topic_clusterings(base):
+            config = replace(base, topic_clustering=topic)
+            options = PipelineOptions(embedding_input_mode=input_mode)
+            runs.append((f"extended-{run_id:03d}", config, options))
+            run_id += 1
     return runs
+
+
+def _alternative_topic_clusterings(base: Config) -> list:
+    """Agglomerative cuts and UMAP-reduced HDBSCAN, at default HDBSCAN params.
+
+    UMAP runs are included only when the optional umap-learn package exists.
+    """
+    topics = [
+        replace(
+            base.topic_clustering,
+            mode="agglomerative",
+            reducer="none",
+            pca_components=None,
+            agglomerative_target_clusters=None,
+            agglomerative_distance_threshold=threshold,
+        )
+        for threshold in (None, 0.3, 0.4, 0.5)
+    ]
+    try:
+        import umap  # noqa: F401
+    except ImportError:
+        return topics
+    topics.extend(
+        replace(
+            base.topic_clustering,
+            mode="density",
+            reducer="umap",
+            pca_components=None,
+            umap_components=components,
+        )
+        for components in (5, 10)
+    )
+    return topics
+
+
+def _reducer_label(config: Config) -> str:
+    topic = config.topic_clustering
+    if topic.mode == "agglomerative":
+        threshold = topic.agglomerative_distance_threshold
+        if topic.agglomerative_target_clusters is not None:
+            return f"agglomerative-k{topic.agglomerative_target_clusters}"
+        if threshold is None:
+            return "agglomerative-auto"
+        return f"agglomerative-d{threshold}"
+    if topic.reducer == "umap":
+        return f"umap-{topic.umap_components}"
+    if topic.pca_components is not None:
+        return f"pca-{topic.pca_components}"
+    return "none"
 
 
 def _run_sweep(
@@ -371,11 +426,8 @@ def _run_sweep(
                     "clustering": asdict(run_config.clustering),
                     "topic_clustering": asdict(run_config.topic_clustering),
                     "allow_single_cluster": run_config.topic_clustering.allow_single_cluster,
-                    "reducer": (
-                        "none"
-                        if run_config.topic_clustering.pca_components is None
-                        else f"pca-{run_config.topic_clustering.pca_components}"
-                    ),
+                    "mode": run_config.topic_clustering.mode,
+                    "reducer": _reducer_label(run_config),
                     "use_cache": use_cache and config.cache.enabled,
                     "repair_noise": use_knn_repair,
                 },

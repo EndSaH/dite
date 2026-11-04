@@ -119,10 +119,24 @@ class CandidateGenerationConfig:
 class TopicClusteringConfig:
     """Topic-clustering controls beyond legacy HDBSCAN defaults."""
 
+    # density: HDBSCAN (+ noise repair / small-cluster merge)
+    # graph: strong content edges first, HDBSCAN on the rest
+    # agglomerative: cosine average-linkage tree, cut by count or distance
     mode: str = "density"
+    # Applies to density mode only: none / pca / umap (umap needs umap-learn).
     reducer: str = "none"
     pca_components: int | None = None
+    umap_components: int = 10
+    umap_neighbors: int = 15
     allow_single_cluster: bool = False
+    # Agglomerative cut: a target cluster count wins over a distance threshold;
+    # with neither set, the cut with the best cosine silhouette is chosen.
+    agglomerative_target_clusters: int | None = None
+    agglomerative_distance_threshold: float | None = None
+
+
+TOPIC_CLUSTERING_MODES = frozenset({"density", "graph", "agglomerative"})
+TOPIC_CLUSTERING_REDUCERS = frozenset({"none", "pca", "umap"})
 
 
 @dataclass
@@ -352,6 +366,18 @@ def _dict_to_config(data: dict[str, Any]) -> Config:
 
     if "i18n" in data:
         config.i18n = I18nConfig(**data["i18n"])
+
+    topic = config.topic_clustering
+    if topic.mode not in TOPIC_CLUSTERING_MODES:
+        raise ValueError(
+            f"topic_clustering.mode must be one of "
+            f"{sorted(TOPIC_CLUSTERING_MODES)}, got {topic.mode!r}"
+        )
+    if topic.reducer not in TOPIC_CLUSTERING_REDUCERS:
+        raise ValueError(
+            f"topic_clustering.reducer must be one of "
+            f"{sorted(TOPIC_CLUSTERING_REDUCERS)}, got {topic.reducer!r}"
+        )
 
     if config.api.max_keepalive_connections > config.api.max_connections:
         raise ValueError(

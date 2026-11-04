@@ -128,7 +128,7 @@ def merge_small_clusters_by_similarity(
     list[SmallClusterMergeEvent],
     list[SmallClusterSkipEvent],
     float | None,
-    ]:
+]:
     """Merge tiny non-noise clusters into the most similar nearby cluster."""
     return _merge_small_clusters_by_similarity_impl(
         embeddings,
@@ -255,6 +255,7 @@ def cluster_documents(
     clustering=None,
     allow_single_cluster: bool = False,
     item_names: list[str] | None = None,
+    cluster_inputs: np.ndarray | None = None,
 ) -> ClusterResult:
     """Compatibility facade around the extracted clustering algorithm module."""
     return _cluster_documents_impl(
@@ -266,6 +267,7 @@ def cluster_documents(
         clustering=clustering,
         allow_single_cluster=allow_single_cluster,
         item_names=item_names,
+        cluster_inputs=cluster_inputs,
         hdbscan_module=hdbscan,
         repair_noise_with_knn_fn=repair_noise_with_knn,
         repair_all_noise_with_similarity_fn=repair_all_noise_with_similarity,

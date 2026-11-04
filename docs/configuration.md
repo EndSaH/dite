@@ -173,16 +173,29 @@ YAML 中的字符串值支持环境变量展开。
 
 字段包括：
 
-- `mode`
-- `reducer`
+- `mode`：`density`（默认，HDBSCAN）/ `graph` / `agglomerative`
+- `reducer`：`none`（默认）/ `pca` / `umap`，只作用于 `density` 模式
 - `pca_components`
+- `umap_components`（默认 10）
+- `umap_neighbors`（默认 15）
 - `allow_single_cluster`
+- `agglomerative_target_clusters`（默认空）
+- `agglomerative_distance_threshold`（默认空）
 
 当前行为要点：
 
 - 这是 V2 主题聚类层的正式默认配置来源。
 - `PipelineOptions.cluster_mode`、`cluster_pca_components` 和 `cluster_allow_single_cluster` 仍存在，但只作为内部实验覆盖层，不是公开 CLI 配置接口。
-- `reducer="pca"` 且 `pca_components` 非空时，会在主题聚类前做 PCA。
+- `mode` 和 `reducer` 写错时，加载配置会直接报错，不再悄悄退回 density。
+- `reducer="pca"` 且 `pca_components` 非空时，HDBSCAN 在 PCA 坐标上运行。
+- `reducer="umap"` 时，HDBSCAN 在 UMAP 坐标上运行（余弦度量、`min_dist=0`、固定随机种子）。需要可选依赖 `umap-learn`：`uv add umap-learn`。没装会报错并给出安装提示。
+- 用了降维时，只有 HDBSCAN 跑在降维坐标上；k-NN 噪音修复和小簇合并仍然用原始归一化 embedding，因为它们的余弦阈值是在原始空间定义的。`cluster_selection_epsilon` 则是降维空间里的距离。
+- `mode="agglomerative"` 用余弦距离 + average linkage 建层次树再切分，不做密度估计，所以在高维和小目录上都比较稳定。切分方式按优先级：
+  - `agglomerative_target_clusters`：想要几个文件夹。只统计成员数达到 `clustering.min_cluster_size` 的簇，零散的离群文件不占名额。
+  - `agglomerative_distance_threshold`：余弦距离阈值，越小分得越细。
+  - 两个都不设：自动选轮廓系数（余弦）最高的切分，最多考虑 50 个簇。这个准则只比较簇内和簇间距离的相对大小，不依赖某个 embedding 模型的绝对相似度区间。
+- agglomerative 模式下，成员数小于 `clustering.min_cluster_size` 的组记为噪音、留在原处；不做 k-NN 噪音修复和小簇合并。近重复预绑定照常生效。它需要 O(n²) 的距离内存，几千个文件以内没问题。
+- 这些新选项都不是默认值。按 `docs/validation.md` 的晋升门槛，需要先在代表性集和对抗集上用 `partition_metrics` 对比，再决定要不要改默认。
 
 ## `cluster_adjudication`
 
