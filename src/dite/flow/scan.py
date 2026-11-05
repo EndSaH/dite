@@ -95,8 +95,11 @@ SKIPPED_FILE_PREFIXES = ("~$",)
 SKIPPED_FILE_NAMES = frozenset({"thumbs.db", "desktop.ini"})
 
 
-def _is_skipped_dir(parent: Path, name: str) -> bool:
-    """根目录之下的子目录 ``parent / name`` 是否应整个跳过。"""
+def is_skipped_dir(parent: Path, name: str) -> bool:
+    """根目录之下的子目录 ``parent / name`` 是否应整个跳过。
+
+    assign 挑选分类文件夹时也用这条规则，保证被扫描跳过的目录不会成为分类。
+    """
     lowered = name.lower()
     return (
         name.startswith(HIDDEN_NAME_PREFIX)
@@ -172,7 +175,7 @@ def scan_files(
     for dirpath, dirnames, filenames in os.walk(folder):
         directory = Path(dirpath)
         if recursive:
-            kept = [name for name in dirnames if not _is_skipped_dir(directory, name)]
+            kept = [name for name in dirnames if not is_skipped_dir(directory, name)]
             ignored_dir_count += len(dirnames) - len(kept)
             dirnames[:] = kept
         else:

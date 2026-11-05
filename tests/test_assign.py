@@ -112,6 +112,24 @@ def test_list_category_folders_skips_hidden_directories(tmp_path: Path) -> None:
     assert [path.name for path in list_category_folders(tmp_path)] == ["a", "b"]
 
 
+def test_list_category_folders_skips_directories_the_scan_skips(
+    tmp_path: Path,
+) -> None:
+    # A new file must never be moved into a dependency, package or virtualenv
+    # directory, so these are not categories even though they hold documents.
+    for name in ("Invoices", "release-1.0", "node_modules", "Tool.app", "__MACOSX"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "README.md").write_text("x", encoding="utf-8")
+    (tmp_path / "venv").mkdir()
+    (tmp_path / "venv" / "pyvenv.cfg").write_text("home = /usr\n", encoding="utf-8")
+    (tmp_path / "venv" / "doc.md").write_text("x", encoding="utf-8")
+
+    assert [path.name for path in list_category_folders(tmp_path)] == [
+        "Invoices",
+        "release-1.0",
+    ]
+
+
 def _write_config(home: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(home))
     config_path = home / ".config" / "dite" / "config.yaml"

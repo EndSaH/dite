@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 
 from dite.doc.embed import normalize_embeddings
+from dite.flow.scan import is_skipped_dir
 
 # Insiders: the least typical 10% of a folder's members.
 FOLDER_FLOOR_PERCENTILE = 10.0
@@ -178,9 +179,13 @@ def assign_to_folders(
 
 
 def list_category_folders(target: Path) -> list[Path]:
-    """Immediate, visible subdirectories of ``target`` (sorted by name)."""
+    """Immediate subdirectories of ``target`` (sorted by name).
+
+    Directories a scan would skip (hidden, dependency, virtualenv and package
+    directories) are not categories, so no file is ever moved into them.
+    """
     return sorted(
         child
         for child in target.iterdir()
-        if child.is_dir() and not child.name.startswith(".")
+        if child.is_dir() and not is_skipped_dir(target, child.name)
     )
