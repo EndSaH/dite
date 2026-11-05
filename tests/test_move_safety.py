@@ -12,6 +12,7 @@ import errno
 import io
 import os
 import shutil
+import signal
 import subprocess
 import unicodedata
 from pathlib import Path
@@ -500,6 +501,86 @@ def test_copy_that_fills_the_disk_while_flushing_leaves_no_partial_file(
     assert _organized_files(preview.target_folder) == []
     assert all(source.stat().st_size == 4096 for source in sources)
     assert len(attempts) == 1
+
+
+def _with_file_size_limit(limit: int, action):
+    """Run ``action`` while files cannot grow past ``limit`` bytes.
+
+    The kernel then cuts a write short and fails the next one, exactly as
+    on a full disk, but only for the files written while the limit holds.
+    """
+    resource = pytest.importorskip("resource")
+    soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+    previous = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (limit, hard))
+    try:
+        return action()
+    finally:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+        signal.signal(signal.SIGXFSZ, previous)
+
+
+def test_a_journal_that_runs_out_of_space_stays_readable(tmp_path: Path) -> None:
+    # Moves within one file system need no space, so the journal is the
+    # first thing a full target refuses.
+    files = [
+        _write(tmp_path / "src" / f"report_{index:02d}_{'x' * 60}.txt", "y")
+        for index in range(30)
+    ]
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", files)
+
+    success, failed = _with_file_size_limit(4096, lambda: _execute(preview))
+
+    assert success > 0
+    assert failed > 0
+    assert success + failed == len(files)
+    contents = read_journal(preview.journal_path)
+    moved = [op for op in preview.operations if op.status == "success"]
+    assert [entry.source for entry in contents.pending] == [op.source for op in moved]
+    assert _organized_files(preview.target_folder) == sorted(
+        op.destination for op in moved
+    )
+    assert find_latest_journal(preview.target_folder) == preview.journal_path
+
+    result = undo_journal(preview.journal_path)
+
+    assert result.skipped == []
+    assert all(path.read_text(encoding="utf-8") == "y" for path in files)
+    assert _organized_files(preview.target_folder) == []
+
+
+def test_a_journal_that_cannot_be_started_moves_nothing(tmp_path: Path) -> None:
+    source = _write(tmp_path / "src" / "a.txt", "payload")
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", [source])
+
+    with pytest.raises(OSError):
+        _with_file_size_limit(64, lambda: _execute(preview))
+
+    assert source.read_text(encoding="utf-8") == "payload"
+    assert list((preview.target_folder / JOURNAL_DIR_NAME).iterdir()) == []
+    assert _organized_files(preview.target_folder) == []
+
+
+def test_undo_ignores_a_journal_line_cut_off_mid_write(tmp_path: Path) -> None:
+    preview, files = _organize(tmp_path, ["a.txt", "b.txt"])
+    with open(preview.journal_path, "ab") as handle:
+        handle.write(b'{"type": "move", "id": 2, "source": "/somewh')
+
+    assert find_latest_journal(preview.target_folder) == preview.journal_path
+    result = undo_journal(preview.journal_path)
+
+    assert result.skipped == []
+    assert len(result.restored) == 2
+    for index, path in enumerate(files):
+        assert path.read_text(encoding="utf-8") == f"payload {index}"
+    # Records appended by undo start on a line of their own.
+    assert read_journal(preview.journal_path).undone is True
 
 
 # ASSIGN-10: partial undo can be retried, moved files are verified.

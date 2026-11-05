@@ -328,7 +328,8 @@ class OrganizePreview:
         Args:
             dry_run: 如果为 True，只预览不执行
             journal_dir: 写入移动记录的目录（通常是 ``目标目录/.dite``）。
-                每完成一次移动就追加一行，所以中途中断也能撤销已完成的部分。
+                每个文件先追加一行记录并落盘、再删除源文件，
+                所以中途中断也能撤销已完成的部分。
 
         Returns:
             (成功数, 失败数)
@@ -554,12 +555,23 @@ def _open_journal(path: Path, mode: str):
     return open(path, mode, encoding="utf-8", errors="surrogateescape")
 
 
-class MoveJournal:
-    """Append-only JSONL record of one organize run, used by ``dite undo``."""
+_JOURNAL_OPEN_FLAGS = os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0)
 
-    def __init__(self, path: Path, handle) -> None:
+
+class MoveJournal:
+    """Append-only JSONL record of one organize run, used by ``dite undo``.
+
+    Records are appended whole or not at all: each goes straight to the file
+    (no buffer that a later flush could fail on) and is fsynced, and a write
+    that fails part way (a full disk) is cut off again.
+    Only a crash in the middle of a write can leave a partial last line,
+    which ``read_journal`` ignores and ``reopen`` removes.
+    """
+
+    def __init__(self, path: Path, fd: int) -> None:
         self.path = path
-        self._handle = handle
+        self._fd = fd
+        self._size = os.fstat(fd).st_size  # bytes of complete records
         self._next_move_id = 0
 
     @classmethod
@@ -573,28 +585,70 @@ class MoveJournal:
         journal_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         path = journal_dir / f"{_JOURNAL_PREFIX}{stamp}{_JOURNAL_SUFFIX}"
-        journal = cls(path, _open_journal(path, "x"))
-        journal._write(
-            {
-                "type": "header",
-                "version": JOURNAL_VERSION,
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-                "source_folder": str(Path(source_folder).resolve()),
-                "target_folder": str(Path(target_folder).resolve()),
-            }
-        )
+        flags = _JOURNAL_OPEN_FLAGS | os.O_CREAT | os.O_EXCL
+        journal = cls(path, os.open(path, flags, 0o666))
+        try:
+            journal._write(
+                {
+                    "type": "header",
+                    "version": JOURNAL_VERSION,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "source_folder": str(Path(source_folder).resolve()),
+                    "target_folder": str(Path(target_folder).resolve()),
+                }
+            )
+        except BaseException:
+            # Nothing has moved yet; an empty journal would only be clutter.
+            journal.close()
+            with suppress(OSError):
+                os.unlink(path)
+            raise
         return journal
 
     @classmethod
     def reopen(cls, path: Path) -> MoveJournal:
         """Open an existing journal to append undo records to it."""
-        return cls(path, _open_journal(path, "a"))
+        journal = cls(path, os.open(path, _JOURNAL_OPEN_FLAGS))
+        try:
+            journal._drop_partial_last_line()
+        except BaseException:
+            journal.close()
+            raise
+        return journal
+
+    def _drop_partial_last_line(self) -> None:
+        """Cut off a last record that a crash left without its newline.
+
+        Otherwise the next record would be appended to that line and the
+        journal could no longer be read.
+        """
+        with open(self.path, "rb") as handle:
+            data = handle.read()
+        complete = data.rfind(b"\n") + 1
+        if complete < len(data):
+            os.ftruncate(self._fd, complete)
+        self._size = complete
 
     def _write(self, record: dict[str, Any]) -> None:
-        self._handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        self._handle.flush()
-        # On disk before the change it vouches for (deleting the source).
-        os.fsync(self._handle.fileno())
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        encoded = line.encode("utf-8", "surrogateescape")
+        remaining = memoryview(encoded)
+        try:
+            while remaining:
+                # A full disk shows as a short write, then a failing one.
+                written = os.write(self._fd, remaining)
+                if written <= 0:
+                    raise OSError(errno.EIO, os.strerror(errno.EIO), str(self.path))
+                remaining = remaining[written:]
+            # On disk before the change it vouches for (deleting the source).
+            os.fsync(self._fd)
+        except BaseException:
+            # Never leave half a record behind: the next one would be
+            # appended to it, and the journal could no longer be read.
+            with suppress(OSError):
+                os.ftruncate(self._fd, self._size)
+            raise
+        self._size += len(encoded)
 
     def record_mkdir(self, directory: Path) -> None:
         self._write({"type": "mkdir", "path": str(Path(directory).resolve())})
@@ -639,7 +693,11 @@ class MoveJournal:
         )
 
     def close(self) -> None:
-        self._handle.close()
+        # Records are written and fsynced one by one: closing cannot lose any.
+        fd, self._fd = self._fd, -1
+        if fd >= 0:
+            with suppress(OSError):
+                os.close(fd)
 
 
 @dataclass(frozen=True)
@@ -681,6 +739,11 @@ def read_journal(path: Path) -> JournalContents:
     undone = False
     with _open_journal(path, "r") as handle:
         for line in handle:
+            if not line.endswith("\n"):
+                # A record counts once its newline is written. Only a crash
+                # in the middle of a write leaves a last line without one,
+                # and nothing was done on the strength of that record.
+                break
             line = line.strip()
             if not line:
                 continue
