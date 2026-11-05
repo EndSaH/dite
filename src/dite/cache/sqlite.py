@@ -126,42 +126,93 @@ class FileCache:
 
         conn.commit()
 
+    @staticmethod
+    def _used_bytes(conn: sqlite3.Connection) -> int:
+        """数据库中实际在用的字节数（不含 freelist 中的空闲页）。
+
+        DELETE 只会把页放进 freelist，文件本身不会变小，所以不能用文件大小
+        判断删除是否已经足够。
+        """
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+        freelist_count = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        return (page_count - freelist_count) * page_size
+
+    @staticmethod
+    def _oldest_ids_covering(
+        conn: sqlite3.Connection, used: int, excess: int
+    ) -> list[int]:
+        """按淘汰顺序取最旧的若干行，使删除它们估计能释放 excess 字节。
+
+        每行的占用按其数据长度乘以“在用字节数 / 全表数据长度”估算，
+        把页内空隙、溢出页尾部等开销也摊进去，避免多删。
+        """
+        cursor = conn.execute(
+            """
+            SELECT id, row_bytes, SUM(row_bytes) OVER () AS total_bytes
+            FROM (
+                SELECT
+                    id,
+                    created_at,
+                    COALESCE(length(CAST(content_md AS BLOB)), 0)
+                        + COALESCE(length(CAST(vlm_content AS BLOB)), 0)
+                        + COALESCE(length(embedding), 0)
+                        + length(CAST(file_path AS BLOB))
+                        + length(CAST(file_hash AS BLOB)) AS row_bytes
+                FROM file_cache
+            )
+            ORDER BY created_at ASC, id ASC
+            """
+        )
+        ids: list[int] = []
+        covered = 0.0
+        try:
+            for row_id, row_bytes, total_bytes in cursor:
+                scale = used / total_bytes if total_bytes else 1.0
+                ids.append(row_id)
+                covered += (row_bytes or 0) * scale
+                if covered >= excess:
+                    break
+        finally:
+            cursor.close()
+        return ids
+
     def _enforce_size_limit(self) -> int:
         """执行缓存大小限制，返回删除的条目数。"""
         if self.max_size_bytes is None or not self.db_path.exists():
             return 0
 
-        current_size = self.db_path.stat().st_size
-        if current_size <= self.max_size_bytes:
+        # 文件大小是在用数据量的上界：文件没超限时无需进一步检查
+        if self.db_path.stat().st_size <= self.max_size_bytes:
             return 0
 
         conn = self._get_conn()
         deleted = 0
         target_size = int(self.max_size_bytes * 0.9)
+        used = self._used_bytes(conn)
 
-        while current_size > target_size:
-            cursor = conn.execute(
-                """
-                DELETE FROM file_cache
-                WHERE id IN (
-                    SELECT id FROM file_cache
-                    ORDER BY created_at ASC, id ASC
-                    LIMIT 100
+        # 只有实际数据超限才删行；文件只是被空闲页撑大时，VACUUM 即可
+        if used > self.max_size_bytes:
+            while used > target_size:
+                ids = self._oldest_ids_covering(conn, used, used - target_size)
+                if not ids:
+                    break
+                cursor = conn.executemany(
+                    "DELETE FROM file_cache WHERE id = ?",
+                    [(row_id,) for row_id in ids],
                 )
-                """
-            )
-            batch = cursor.rowcount if cursor.rowcount is not None else 0
-            if batch <= 0:
-                break
-            deleted += batch
-            conn.commit()
-            current_size = self.db_path.stat().st_size
+                conn.commit()
+                batch = cursor.rowcount if cursor.rowcount is not None else 0
+                if batch <= 0:
+                    break
+                deleted += batch
+                used = self._used_bytes(conn)
 
-        # 使用独立连接执行 VACUUM，避免事务上下文冲突
-        if deleted > 0:
-            conn.commit()
-            with sqlite3.connect(str(self.db_path)) as vacuum_conn:
-                vacuum_conn.execute("VACUUM")
+        # 使用独立连接执行 VACUUM，避免事务上下文冲突；
+        # 它把 freelist 中的页还给文件系统，文件才会真正变小
+        conn.commit()
+        with sqlite3.connect(str(self.db_path)) as vacuum_conn:
+            vacuum_conn.execute("VACUUM")
 
         return deleted
 

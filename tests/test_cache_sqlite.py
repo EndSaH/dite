@@ -222,6 +222,69 @@ def test_cache_enforces_size_limit(tmp_path: Path) -> None:
     assert db_path.stat().st_size <= int(max_size_gb * 1024 * 1024 * 1024 * 1.2)
 
 
+def _fill_cache_rows(db_path: Path, tmp_path: Path, count: int) -> None:
+    cache = FileCache(db_path=db_path)
+    for i in range(count):
+        cache.save(
+            file_path=tmp_path / f"doc_{i:03d}.txt",
+            file_hash=f"hash-{i:03d}",
+            file_mtime=1.0,
+            content_md="x" * 8192,
+            embedding=np.zeros(256, dtype=np.float32),
+            model_version="embed-v1",
+            enforce_size_limit=False,
+        )
+    cache.close()
+
+
+def _row_ids(db_path: Path) -> list[int]:
+    with sqlite3.connect(db_path) as conn:
+        return [row[0] for row in conn.execute("SELECT id FROM file_cache ORDER BY id")]
+
+
+def test_size_limit_evicts_only_oldest_rows_until_under_limit(tmp_path: Path) -> None:
+    db_path = tmp_path / "cache.db"
+    _fill_cache_rows(db_path, tmp_path, 40)
+    ids_before = _row_ids(db_path)
+    max_size_bytes = 200 * 1024
+    assert db_path.stat().st_size > 1.5 * max_size_bytes
+
+    cache = FileCache(db_path=db_path, max_size_gb=max_size_bytes / 1024**3)
+    deleted = cache.enforce_size_limit()
+    cache.close()
+
+    ids_after = _row_ids(db_path)
+    # Only part of the cache is evicted, and it is the oldest part.
+    assert 0 < deleted < len(ids_before)
+    assert len(ids_after) == len(ids_before) - deleted
+    assert ids_after == ids_before[deleted:]
+    # Eviction stops near the 90% target instead of emptying the table:
+    # each row takes roughly 9-10 KB, so well over 10 rows fit under 180 KB.
+    assert len(ids_after) >= 10
+    assert db_path.stat().st_size <= max_size_bytes
+
+
+def test_size_limit_keeps_rows_when_only_free_pages_exceed_limit(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "cache.db"
+    _fill_cache_rows(db_path, tmp_path, 40)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM file_cache WHERE id > 5")
+    ids_before = _row_ids(db_path)
+    max_size_bytes = 200 * 1024
+    # Deleted rows only move pages to the freelist; the file stays large.
+    assert db_path.stat().st_size > 1.5 * max_size_bytes
+
+    cache = FileCache(db_path=db_path, max_size_gb=max_size_bytes / 1024**3)
+    deleted = cache.enforce_size_limit()
+    cache.close()
+
+    assert deleted == 0
+    assert _row_ids(db_path) == ids_before
+    assert db_path.stat().st_size <= max_size_bytes
+
+
 def test_get_embedding_misses_when_model_version_changes(tmp_path: Path) -> None:
     db_path = tmp_path / "cache.db"
     file_path = tmp_path / "doc.txt"
