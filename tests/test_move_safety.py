@@ -14,6 +14,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import unicodedata
 from pathlib import Path
 
@@ -528,6 +529,245 @@ def test_copy_that_fills_the_disk_while_flushing_leaves_no_partial_file(
     assert len(attempts) == 1
 
 
+# Run in a child process, so that a signal can end it for real.
+_KILLED_MID_COPY = """
+import errno
+import os
+import shutil
+import signal
+import sys
+from pathlib import Path
+
+from dite.flow.move import (
+    JOURNAL_DIR_NAME,
+    OrganizePreview,
+    find_latest_journal,
+    undo_journal,
+)
+
+mode, signal_name = sys.argv[1], sys.argv[2]
+src, out = Path(sys.argv[3]), Path(sys.argv[4])
+
+
+def tree(path):
+    path = Path(path)
+    return next((r for r in (src, out) if r == path or r in path.parents), None)
+
+
+def within_one_tree(real):
+    def call(a, b, *args, **kwargs):
+        if tree(a) != tree(b):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        return real(a, b, *args, **kwargs)
+
+    return call
+
+
+# src and out stand for two file systems: no link or rename between them.
+os.link = within_one_tree(os.link)
+os.rename = within_one_tree(os.rename)
+os.replace = within_one_tree(os.replace)
+for fast_copy in ("_USE_CP_SENDFILE", "_USE_CP_COPY_FILE_RANGE", "_HAS_FCOPYFILE"):
+    if hasattr(shutil, fast_copy):
+        setattr(shutil, fast_copy, False)
+real_copyfileobj = shutil.copyfileobj
+copies = []
+
+
+def copyfileobj(fsrc, fdst, *args, **kwargs):
+    copies.append(fsrc.name)
+    if len(copies) == 2:  # the signal comes with the second file half copied
+        fdst.write(fsrc.read(1000))
+        fdst.flush()
+        os.kill(os.getpid(), getattr(signal, signal_name))
+    return real_copyfileobj(fsrc, fdst, *args, **kwargs)
+
+
+shutil.copyfileobj = copyfileobj
+if mode == "execute":
+    preview = OrganizePreview(source_folder=src, target_folder=out)
+    preview.add_cluster("Topic", sorted(src.iterdir()))
+    preview.execute(dry_run=False, journal_dir=out / JOURNAL_DIR_NAME)
+else:
+    undo_journal(find_latest_journal(out))
+"""
+
+_PAYLOADS = {f"doc{index}.pdf": bytes([65 + index]) * 5000 for index in range(3)}
+
+
+def _write_payloads(folder: Path) -> None:
+    folder.mkdir(parents=True)
+    for name, data in _PAYLOADS.items():
+        (folder / name).write_bytes(data)
+
+
+def _assert_payloads_back(folder: Path) -> None:
+    for name, data in _PAYLOADS.items():
+        assert (folder / name).read_bytes() == data
+
+
+def _kill_mid_copy(tmp_path: Path, mode: str, signal_name: str):
+    """Organize (or undo) src <-> out as if on two file systems, in a child
+    process that gets ``signal_name`` with the second file half copied."""
+    child = tmp_path / "bin" / "killed_mid_copy.py"
+    child.parent.mkdir()
+    child.write_text(_KILLED_MID_COPY, encoding="utf-8")
+    src_dir = Path(move_module.__file__).parents[2]
+    return subprocess.run(
+        [sys.executable, str(child), mode, signal_name]
+        + [str(tmp_path / "src"), str(tmp_path / "out")],
+        env=dict(os.environ, PYTHONPATH=str(src_dir)),
+        capture_output=True,
+        timeout=120,
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs POSIX signals")
+@pytest.mark.parametrize("signal_name", ["SIGTERM", "SIGHUP", "SIGKILL"])
+def test_organize_killed_mid_copy_leaves_nothing_undo_cannot_clean_up(
+    tmp_path: Path, signal_name: str
+) -> None:
+    _write_payloads(tmp_path / "src")
+
+    run = _kill_mid_copy(tmp_path, "execute", signal_name)
+
+    assert run.returncode != 0, run.stderr
+    left = sorted(os.listdir(tmp_path / "out" / "Topic"))
+    if signal_name == "SIGKILL":
+        # Nothing runs on kill -9, but the half copy has no real name.
+        assert [name for name in left if not name.startswith(".")] == ["doc0.pdf"]
+    else:
+        assert left == ["doc0.pdf"]
+    assert (tmp_path / "src" / "doc1.pdf").read_bytes() == _PAYLOADS["doc1.pdf"]
+
+    result = undo_journal(find_latest_journal(tmp_path / "out"))
+
+    assert result.skipped == []
+    _assert_payloads_back(tmp_path / "src")
+    assert _organized_files(tmp_path / "out") == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs POSIX signals")
+@pytest.mark.parametrize("signal_name", ["SIGTERM", "SIGKILL"])
+def test_undo_killed_mid_copy_can_be_retried(tmp_path: Path, signal_name: str) -> None:
+    _write_payloads(tmp_path / "src")
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", sorted((tmp_path / "src").iterdir()))
+    assert _execute(preview) == (3, 0)
+
+    run = _kill_mid_copy(tmp_path, "undo", signal_name)
+
+    assert run.returncode != 0, run.stderr
+    # doc2 was copied back first; the half copy of doc1 has no real name, so
+    # it is not taken for a file the user put there.
+    left = sorted(os.listdir(tmp_path / "src"))
+    assert [name for name in left if not name.startswith(".")] == ["doc2.pdf"]
+
+    result = undo_journal(find_latest_journal(tmp_path / "out"))
+
+    assert result.skipped == []
+    _assert_payloads_back(tmp_path / "src")
+    assert sorted(os.listdir(tmp_path / "src")) == sorted(_PAYLOADS)
+    assert _organized_files(tmp_path / "out") == []
+
+
+def test_without_hard_links_a_copy_never_replaces_a_file_that_appears_meanwhile(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = _write(tmp_path / "src" / "a.txt", "payload")
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", [source])
+    planned = preview.operations[0].destination
+    real_copystat = shutil.copystat
+
+    def no_link(*_args, **_kwargs):  # FAT, exFAT
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    def copystat_then_race(src, dst, *args, **kwargs):
+        real_copystat(src, dst, *args, **kwargs)
+        if not planned.exists():  # another program takes the name meanwhile
+            planned.write_text("someone else's file", encoding="utf-8")
+
+    monkeypatch.setattr(os, "link", no_link)
+    monkeypatch.setattr(shutil, "copystat", copystat_then_race)
+
+    assert _execute(preview) == (1, 0)
+
+    moved = preview.operations[0].destination
+    assert planned.read_text(encoding="utf-8") == "someone else's file"
+    assert moved != planned
+    assert moved.read_text(encoding="utf-8") == "payload"
+    assert sorted(os.listdir(moved.parent)) == sorted([planned.name, moved.name])
+    assert not source.exists()
+
+    result = undo_journal(preview.journal_path)
+
+    assert result.skipped == []
+    assert source.read_text(encoding="utf-8") == "payload"
+    assert os.listdir(source.parent) == [source.name]
+
+
+@pytest.mark.parametrize("phase", ["execute", "undo"])
+def test_without_hard_links_ctrl_c_as_the_name_is_claimed_leaves_no_empty_file(
+    tmp_path: Path, monkeypatch, phase: str
+) -> None:
+    source = _write(tmp_path / "src" / "a.txt", "payload")
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", [source])
+    if phase == "undo":
+        assert _execute(preview) == (1, 0)
+    real_open = os.open
+
+    def no_link(*_args, **_kwargs):  # FAT, exFAT
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    def open_then_interrupt(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if flags & os.O_EXCL and Path(path).name == "a.txt":
+            signal.raise_signal(signal.SIGINT)  # raised as open() returns
+        return fd
+
+    monkeypatch.setattr(os, "link", no_link)
+    monkeypatch.setattr(os, "open", open_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        if phase == "execute":
+            _execute(preview)
+        else:
+            undo_journal(preview.journal_path)
+    monkeypatch.undo()
+
+    if phase == "execute":
+        assert source.read_text(encoding="utf-8") == "payload"
+        assert _organized_files(preview.target_folder) == []
+    else:
+        # No empty file at the original location for a retry to trip over.
+        assert not source.exists()
+        assert undo_journal(preview.journal_path).skipped == []
+        assert source.read_text(encoding="utf-8") == "payload"
+
+
+def test_execute_removes_partial_copies_a_killed_run_left(tmp_path: Path) -> None:
+    source = _write(tmp_path / "src" / "a.txt", "payload")
+    stale = _write(tmp_path / "out" / "Topic" / f".dite-partial-{'0' * 32}", "hal")
+    unrelated = _write(tmp_path / "out" / "Topic" / ".dite-partial-notes", "mine")
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", [source])
+
+    assert _execute(preview) == (1, 0)
+
+    assert not stale.exists()
+    assert unrelated.read_text(encoding="utf-8") == "mine"
+
+
 def _with_file_size_limit(limit: int, action):
     """Run ``action`` while files cannot grow past ``limit`` bytes.
 
@@ -590,6 +830,32 @@ def test_a_journal_that_cannot_be_started_moves_nothing(tmp_path: Path) -> None:
     assert source.read_text(encoding="utf-8") == "payload"
     assert list((preview.target_folder / JOURNAL_DIR_NAME).iterdir()) == []
     assert _organized_files(preview.target_folder) == []
+
+
+def test_ctrl_c_as_the_journal_is_created_leaves_no_empty_journal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = _write(tmp_path / "src" / "a.txt", "payload")
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", [source])
+    real_open = os.open
+
+    def open_then_interrupt(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if Path(path).suffix == ".jsonl" and flags & os.O_CREAT:
+            signal.raise_signal(signal.SIGINT)  # raised as open() returns
+        return fd
+
+    monkeypatch.setattr(os, "open", open_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        _execute(preview)
+    monkeypatch.undo()
+
+    assert source.read_text(encoding="utf-8") == "payload"
+    assert list((preview.target_folder / JOURNAL_DIR_NAME).iterdir()) == []
 
 
 def test_undo_ignores_a_journal_line_cut_off_mid_write(tmp_path: Path) -> None:

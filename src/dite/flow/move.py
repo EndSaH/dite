@@ -6,11 +6,15 @@ import errno
 import filecmp
 import json
 import os
+import re
 import shlex
 import shutil
+import signal
 import stat
 import unicodedata
-from contextlib import suppress
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -340,10 +344,15 @@ class OrganizePreview:
         the journal hold the name actually used. Each move is journaled
         before its source is deleted, and a failed move leaves no copy
         behind. A full or read-only target stops the remaining moves.
+        SIGTERM and SIGHUP stop the run the way Ctrl-C does, cleanup
+        included (see ``_interrupt_on_termination``).
         """
         if dry_run:
             return len(self.operations), 0
+        with _interrupt_on_termination():
+            return self._execute(journal_dir)
 
+    def _execute(self, journal_dir: Path | None) -> tuple[int, int]:
         success = 0
         failed = 0
         # A run with nothing to move leaves no journal: an empty journal would
@@ -368,6 +377,7 @@ class OrganizePreview:
                 if journal is not None:
                     for directory in created:
                         journal.record_mkdir(directory)
+                _remove_partials(dest_dir)
 
             # Every planned name, so a late rename cannot take another
             # operation's destination.
@@ -418,20 +428,92 @@ _ABORT_ERRNOS = frozenset(
 )
 _MAX_RENAME_ATTEMPTS = 10_000
 
+# Signals whose default action ends the process on the spot, running no
+# cleanup at all: closing the terminal, shutdown, `timeout`, an IDE's stop.
+_TERMINATION_SIGNALS = tuple(
+    getattr(signal, name)
+    for name in ("SIGTERM", "SIGHUP", "SIGBREAK")
+    if hasattr(signal, name)
+)
+
+
+_held_back = 0  # depth of _Uninterrupted sections
+_interrupt_pending = False
+
+
+def _raise_interrupt(signum: int, frame: Any) -> None:
+    """Signal handler: ``KeyboardInterrupt``, after any ``_Uninterrupted``."""
+    global _interrupt_pending
+    if _held_back:
+        _interrupt_pending = True
+        return
+    raise KeyboardInterrupt
+
+
+class _Uninterrupted:
+    """Hold an interrupt back for a few statements that must run together.
+
+    Only interrupts that come through ``_raise_interrupt`` wait.
+    """
+
+    def __enter__(self) -> None:
+        global _held_back
+        _held_back += 1
+
+    def __exit__(self, *exc_info: object) -> None:
+        global _held_back, _interrupt_pending
+        _held_back -= 1
+        if not _held_back and _interrupt_pending:
+            _interrupt_pending = False
+            raise KeyboardInterrupt
+
+
+@contextmanager
+def _interrupt_on_termination() -> Iterator[None]:
+    """Make SIGTERM and SIGHUP raise ``KeyboardInterrupt`` while files move.
+
+    Otherwise they end the process at once, and a copy cut short or a name
+    not yet journaled stays behind; as a ``KeyboardInterrupt`` they go
+    through the same cleanup as Ctrl-C. Ctrl-C goes through the same
+    handler, so that ``_Uninterrupted`` can hold any of them back. Only
+    signals still at their default action (Python's own handler, for
+    SIGINT) are changed: an ignored one (``nohup``) or a handler the program
+    installed is left alone, and so is everything outside the main thread,
+    the only one that may set handlers.
+    """
+    global _interrupt_pending
+    _interrupt_pending = False
+    previous: dict[int, Any] = {}
+    for signum in (signal.SIGINT, *_TERMINATION_SIGNALS):
+        default = (
+            signal.default_int_handler if signum == signal.SIGINT else signal.SIG_DFL
+        )
+        try:
+            if signal.getsignal(signum) == default:
+                previous[signum] = signal.signal(signum, _raise_interrupt)
+        except (OSError, ValueError):
+            continue
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            with suppress(OSError, ValueError):
+                signal.signal(signum, handler)
+
 
 def _move_file(op: FileOperation, journal: MoveJournal | None, taken: set[str]) -> None:
     """Move ``op.source`` to ``op.destination`` (or the next free name).
 
     The new name is created first and journaled, and only then is the source
-    deleted, so an error or Ctrl-C leaves at worst a second name for a file
-    the journal knows about, never a moved file that undo cannot find. The
-    new name is removed again only while the source is known to be there:
-    when creating or journaling it is interrupted or fails, or when deleting
-    the source fails and the source still exists. A process killed (or a
-    machine losing power) between creating the new name and the journal
-    write can still leave that name behind unrecorded, next to the untouched
-    source; for a copy, so can a Ctrl-C that lands just as the new file is
-    opened or just as a finished copy returns.
+    deleted, so an error or an interrupt (Ctrl-C, SIGTERM, SIGHUP) leaves at
+    worst a second name for a file the journal knows about, never a moved
+    file that undo cannot find. The new name is removed again only while the
+    source is known to be there: when creating or journaling it is
+    interrupted or fails, or when deleting the source fails and the source
+    still exists. A kill -9 or a power loss after the new name is made and
+    before it is journaled leaves it behind unrecorded, a complete second
+    name next to the untouched source; a copy that such a kill cuts short
+    leaves only a hidden ``.dite-partial-*`` file (see ``_copy_new``).
     """
     new_name = _NewName()
     move_id: int | None = None
@@ -481,18 +563,33 @@ class _NewName:
 
     path: Path | None = None
     created: bool = False
+    # (st_dev, st_ino) of the files _copy_new made for it.
+    copies: set[tuple[int, int]] = field(default_factory=set)
 
     def discard(self, source: Path) -> None:
         """Remove the name if it was made for ``source``.
 
-        A Ctrl-C raised as ``os.link`` returns leaves ``created`` unset, but
-        the name is then a hard link to ``source`` itself.
+        An interrupt raised just as the name is made leaves ``created``
+        unset, but the name is then a hard link to ``source`` itself or one
+        of the copies made for it.
         """
         if self.path is None:
             return
-        if self.created or _same_inode(source, self.path):
+        if (
+            self.created
+            or _same_inode(source, self.path)
+            or _identity(self.path) in self.copies
+        ):
             with suppress(OSError):
                 os.unlink(self.path)
+
+
+def _identity(path: Path) -> tuple[int, int] | None:
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
 
 
 def _same_inode(first: Path, second: Path) -> bool:
@@ -511,8 +608,9 @@ def _create_unique(
     counter = 1
     for _ in range(_MAX_RENAME_ATTEMPTS):
         new_name.path, new_name.created = candidate, False
+        new_name.copies.clear()  # only files that exist for this attempt
         try:
-            _create_new(source, candidate)
+            _create_new(source, candidate, new_name.copies)
         except FileExistsError:
             new_name.path = None  # someone else's file
         else:
@@ -529,7 +627,9 @@ def _create_unique(
     raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(destination))
 
 
-def _create_new(source: Path, destination: Path) -> None:
+def _create_new(
+    source: Path, destination: Path, copies: set[tuple[int, int]] | None = None
+) -> None:
     """Give the content of ``source`` the new name ``destination``.
 
     Raises ``FileExistsError`` instead of replacing anything, judged by the
@@ -537,7 +637,8 @@ def _create_new(source: Path, destination: Path) -> None:
     where possible: it is atomic and keeps the file as it is, inode and
     metadata included. Across file systems, on file systems without hard
     links (FAT, exFAT, some network shares) and for symlinks, whose target's
-    content is moved as before, the file is copied instead.
+    content is moved as before, the file is copied instead; the identity of
+    each file the copy makes is added to ``copies``.
     """
     if not source.is_symlink():
         try:
@@ -547,30 +648,111 @@ def _create_new(source: Path, destination: Path) -> None:
             raise
         except OSError:
             pass
-    _copy_new(source, destination)
+    _copy_new(source, destination, set() if copies is None else copies)
 
 
-def _copy_new(source: Path, destination: Path) -> None:
-    """Copy ``source`` to a newly created ``destination``, removed on failure."""
-    # "x" never truncates an existing file; it raises FileExistsError.
-    with open(source, "rb") as fsrc, open(destination, "xb") as fdst:
-        try:
+_PARTIAL_PREFIX = ".dite-partial-"
+_PARTIAL_NAME = re.compile(re.escape(_PARTIAL_PREFIX) + "[0-9a-f]{32}")
+
+
+def _copy_new(source: Path, destination: Path, copies: set[tuple[int, int]]) -> None:
+    """Copy ``source`` to the new name ``destination``.
+
+    The data goes to a hidden ``.dite-partial-<random>`` file next to
+    ``destination`` first, and only a complete copy that is on disk gets
+    the real name, so a copy cut short (a full disk, an interrupt, even a
+    kill -9 or a power loss) never leaves a truncated file under a real name,
+    one that undo or the next organize would take for the user's. A partial
+    file a kill leaves behind is removed by ``_remove_partials``.
+    """
+    if os.path.lexists(destination):  # spare a copy that could not be named
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(destination))
+    partial = destination.with_name(f"{_PARTIAL_PREFIX}{uuid.uuid4().hex}")
+    try:
+        # "x" never truncates an existing file; it raises FileExistsError.
+        # A failed flush (a full disk) fails again in close(), which still
+        # closes the file.
+        with open(source, "rb") as fsrc, open(partial, "xb") as fdst:
+            copies.add(_fd_identity(fdst.fileno()))
             shutil.copyfileobj(fsrc, fdst)
             fdst.flush()
             os.fsync(fdst.fileno())
             if os.fstat(fdst.fileno()).st_size != os.fstat(fsrc.fileno()).st_size:
                 raise OSError(t("error_copy_failed"))
-            fdst.close()  # here, so that an error closing it is cleaned up too
-            shutil.copystat(source, destination)
-        except BaseException:
-            # After a failed flush (a full disk) close() flushes again and
-            # fails again, but it still closes the file; closing it a second
-            # time, when the with block ends, does nothing.
-            with suppress(OSError):
-                fdst.close()
+        shutil.copystat(source, partial)
+        _name_copy(partial, destination, copies)
+        # The new name must be on disk before the source can be deleted.
+        _fsync_directory(destination.parent)
+    except BaseException:
+        if _identity(destination) in copies:  # named just before the error
             with suppress(OSError):
                 os.unlink(destination)
-            raise
+        raise
+    finally:
+        with suppress(OSError):
+            os.unlink(partial)  # the extra name; already gone after a rename
+
+
+def _name_copy(partial: Path, destination: Path, copies: set[tuple[int, int]]) -> None:
+    """Give the finished copy ``partial`` the name ``destination``.
+
+    Never replaces a file: a hard link fails when the name is taken. Where
+    there are no hard links, the name is claimed with an empty file created
+    with O_EXCL, and the copy is renamed over that file of our own.
+    """
+    try:
+        os.link(partial, destination)
+        return
+    except FileExistsError:
+        raise
+    except OSError:
+        pass  # FAT, exFAT, some network shares
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    # Until its identity is known, an empty file left by an interrupt could
+    # not be told from someone else's.
+    with _Uninterrupted():
+        fd = os.open(destination, flags, 0o666)
+        try:
+            copies.add(_fd_identity(fd))
+        finally:
+            os.close(fd)
+    os.replace(partial, destination)
+
+
+def _fd_identity(fd: int) -> tuple[int, int]:
+    info = os.fstat(fd)
+    return info.st_dev, info.st_ino
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Flush the entries of ``directory`` to disk, where that is possible."""
+    try:
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return  # Windows cannot open a directory
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _remove_partials(directory: Path) -> None:
+    """Delete the partial copies a killed run left in ``directory``.
+
+    Only regular files with the names ``_copy_new`` makes are touched.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if _PARTIAL_NAME.fullmatch(name):
+            path = directory / name
+            with suppress(OSError):
+                if stat.S_ISREG(os.lstat(path).st_mode):
+                    os.unlink(path)
 
 
 def _missing_ancestors(directory: Path) -> list[Path]:
@@ -621,8 +803,10 @@ class MoveJournal:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         path = journal_dir / f"{_JOURNAL_PREFIX}{stamp}{_JOURNAL_SUFFIX}"
         flags = _JOURNAL_OPEN_FLAGS | os.O_CREAT | os.O_EXCL
-        journal = cls(path, os.open(path, flags, 0o666))
+        journal: MoveJournal | None = None
         try:
+            with _Uninterrupted():  # an interrupt waits until the file is ours
+                journal = cls(path, os.open(path, flags, 0o666))
             journal._write(
                 {
                     "type": "header",
@@ -634,9 +818,10 @@ class MoveJournal:
             )
         except BaseException:
             # Nothing has moved yet; an empty journal would only be clutter.
-            journal.close()
-            with suppress(OSError):
-                os.unlink(path)
+            if journal is not None:
+                journal.close()
+                with suppress(OSError):
+                    os.unlink(path)
             raise
         return journal
 
@@ -871,8 +1056,17 @@ def undo_journal(journal_path: Path, *, dry_run: bool = False) -> UndoResult:
     Each file moved back is journaled right away. The journal is marked
     undone only when nothing is left that a retry could restore; after a
     conflict or an I/O error it stays open, and undoing it again retries just
-    the moves that are left.
+    the moves that are left. Partial copies that a killed organize or undo
+    left next to these files are removed. SIGTERM and SIGHUP stop the run
+    the way Ctrl-C does.
     """
+    if dry_run:
+        return _undo_journal(journal_path, dry_run=True)
+    with _interrupt_on_termination():
+        return _undo_journal(journal_path, dry_run=False)
+
+
+def _undo_journal(journal_path: Path, *, dry_run: bool) -> UndoResult:
     contents = read_journal(journal_path)
     if contents.undone:
         raise ValueError(f"journal already undone: {journal_path}")
@@ -891,6 +1085,11 @@ def undo_journal(journal_path: Path, *, dry_run: bool = False) -> UndoResult:
         if journal is None:
             return result
 
+        folders = set(contents.created_dirs)
+        for entry in contents.pending:
+            folders.update((entry.source.parent, entry.destination.parent))
+        for directory in folders:
+            _remove_partials(directory)
         for directory in sorted(
             set(contents.created_dirs), key=lambda item: len(item.parts), reverse=True
         ):
