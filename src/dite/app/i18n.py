@@ -282,6 +282,7 @@ class Messages:
     debug_cluster_name_retry: str
     debug_cluster_name_empty_fallback: str
     debug_cluster_name_invalid_fallback: str
+    debug_cluster_name_cut_off_fallback: str
     debug_cluster_name_failed_fallback: str
     debug_cluster_merge: str
     debug_cluster_name_result: str
@@ -665,6 +666,9 @@ ZH_CN = Messages(
     debug_cluster_name_retry="簇命名请求失败 (尝试 {attempt}/{max_retries})：{error}",
     debug_cluster_name_empty_fallback="簇命名返回空结果，使用回退名称: {fallback}",
     debug_cluster_name_invalid_fallback="簇命名返回无效名称，使用回退名称: {fallback}",
+    debug_cluster_name_cut_off_fallback=(
+        "簇命名回复在第一行结束前被 max_tokens 截断，使用回退名称: {fallback}"
+    ),
     debug_cluster_name_failed_fallback="簇命名失败，使用回退名称 {fallback}: {error}",
     debug_cluster_merge="合并簇 {source} -> {target} (名称: {name})",
     debug_cluster_name_result="簇 {label} 命名为 {name} (files={count})",
@@ -682,7 +686,7 @@ ZH_CN = Messages(
     ),
     warning_cluster_naming_fallback=(
         "LLM 簇命名有 {fallback}/{total} 个簇退回了启发式名称（请求失败 {failed} 个，"
-        "回复为空或只有推理内容 {empty} 个，名称不可用 {invalid} 个）。"
+        "回复为空、只有推理内容或被截断 {empty} 个，名称不可用 {invalid} 个）。"
         "使用 --verbose 查看每个簇的详情。"
     ),
     warning_cluster_naming_first_error="第一个簇命名错误：{error}",
@@ -1126,6 +1130,10 @@ EN = Messages(
     debug_cluster_name_invalid_fallback=(
         "Cluster naming returned invalid name, using fallback: {fallback}"
     ),
+    debug_cluster_name_cut_off_fallback=(
+        "Cluster naming reply was cut off by max_tokens before its first line "
+        "ended, using fallback: {fallback}"
+    ),
     debug_cluster_name_failed_fallback=(
         "Cluster naming failed, using fallback {fallback}: {error}"
     ),
@@ -1145,9 +1153,9 @@ EN = Messages(
     ),
     warning_cluster_naming_fallback=(
         "LLM cluster naming fell back to heuristic names for {fallback} of "
-        "{total} clusters (request failed: {failed}, empty or reasoning-only "
-        "reply: {empty}, unusable name: {invalid}). Run with --verbose for "
-        "per-cluster details."
+        "{total} clusters (request failed: {failed}, empty, reasoning-only or "
+        "cut-off reply: {empty}, unusable name: {invalid}). Run with --verbose "
+        "for per-cluster details."
     ),
     warning_cluster_naming_first_error="First cluster naming error: {error}",
     warning_cluster_naming_reasoning_hint=(

@@ -36,6 +36,7 @@ class ChatCompletionResult:
     error: BaseException | None
     queue_wait_sec: float
     request_elapsed_sec: float
+    finish_reason: str | None = None
 
 
 def build_httpx_timeout(config: Config) -> httpx.Timeout:
@@ -296,12 +297,14 @@ class AsyncRequestRuntime:
         started_at = asyncio.get_running_loop().time()
         try:
             response = await client.chat.completions.create(**request.kwargs)
-            content = response.choices[0].message.content or ""
+            choice = response.choices[0]
+            content = choice.message.content or ""
             return ChatCompletionResult(
                 content=content,
                 error=None,
                 queue_wait_sec=started_at - queued_at,
                 request_elapsed_sec=asyncio.get_running_loop().time() - started_at,
+                finish_reason=getattr(choice, "finish_reason", None),
             )
         except BaseException as exc:
             return ChatCompletionResult(

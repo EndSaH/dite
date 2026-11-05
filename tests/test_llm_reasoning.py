@@ -102,9 +102,15 @@ class _ReplyClient:
 
 
 class _Runtime:
-    def __init__(self, contents: list[str | None], error: object = None) -> None:
+    def __init__(
+        self,
+        contents: list[str | None],
+        error: object = None,
+        finish_reason: str | None = None,
+    ) -> None:
         self._contents = contents
         self._error = error
+        self._finish_reason = finish_reason
         self.batches: list[list] = []
 
     def run_cluster_naming_batch(self, requests):
@@ -115,6 +121,7 @@ class _Runtime:
                 error=self._error,
                 queue_wait_sec=0.0,
                 request_elapsed_sec=0.0,
+                finish_reason=self._finish_reason,
             )
             for content in self._contents[: len(requests)]
         ]
@@ -306,6 +313,8 @@ def test_ordinary_cluster_names_stay_valid() -> None:
         ("Category name: Tax Filings", "Tax Filings"),
         ("名称：财务报表", "财务报表"),
         ("类别名称: 线性代数", "线性代数"),
+        ("**Tax** Filings", "Tax Filings"),
+        ("Financial Reports<|im_end|>", "Financial Reports"),
     ],
 )
 def test_generate_cluster_name_cleans_model_reply(reply: str, expected: str) -> None:
@@ -362,6 +371,95 @@ def test_unclosed_think_replies_do_not_collapse_clusters_sync(
     }
     assert named.name_clusters_merged == 0
     assert np.array_equal(named.labels, np.array([0, 0, 1, 1, 2, 2]))
+
+
+# Chat templates that open <think> in the prompt (QwQ, DeepSeek-R1 distills,
+# Qwen3 Thinking) leave the reasoning untagged; max_tokens cuts it mid-line.
+UNTAGGED_CUT_OFF_REASONING = "Okay, the user wants me to name this category. Let me"
+
+
+@pytest.mark.parametrize("module_name", ["dite.cluster.api", "dite.cluster.name"])
+def test_cut_off_untagged_reasoning_does_not_collapse_clusters_sync(
+    module_name: str, capsys
+) -> None:
+    import importlib
+
+    module = importlib.import_module(module_name)
+    named = module.generate_all_cluster_names(
+        _ReplyClient(UNTAGGED_CUT_OFF_REASONING, finish_reason="length"),
+        _cluster_result([0, 0, 1, 1, 2, 2]),
+        NAMING_CONTENTS,
+        NAMING_FILES,
+        config=Config(),
+        merge_same_name=True,
+        llm_model="dummy-model",
+    )
+
+    assert named.cluster_names == {
+        0: "Matrix Rank Notes",
+        1: "Quarterly Budget Review",
+        2: "Organic Chemistry Lab",
+    }
+    assert named.name_clusters_merged == 0
+    output = _flat(capsys.readouterr().out)
+    assert "empty, reasoning-only or cut-off reply: 3" in output
+    assert "raise its max_tokens" in output
+
+
+@pytest.mark.parametrize("module_name", ["dite.cluster.api", "dite.cluster.name"])
+def test_cut_off_untagged_reasoning_does_not_collapse_clusters_async(
+    module_name: str,
+) -> None:
+    import importlib
+
+    module = importlib.import_module(module_name)
+    runtime = _Runtime([UNTAGGED_CUT_OFF_REASONING] * 3, finish_reason="length")
+    named = module.generate_all_cluster_names(
+        _Endpoint("http://localhost:8000/v1"),
+        _cluster_result([0, 0, 1, 1, 2, 2]),
+        NAMING_CONTENTS,
+        NAMING_FILES,
+        config=Config(),
+        merge_same_name=True,
+        llm_model="dummy-model",
+        request_runtime=runtime,
+    )
+
+    assert named.cluster_names == {
+        0: "Matrix Rank Notes",
+        1: "Quarterly Budget Review",
+        2: "Organic Chemistry Lab",
+    }
+    assert named.name_clusters_merged == 0
+
+
+@pytest.mark.parametrize(
+    ("reply", "finish_reason", "expected"),
+    [
+        # The first line ended before max_tokens did, so the name is whole.
+        (
+            "Linear Algebra\n\nThese files cover matrices and",
+            "length",
+            "Linear Algebra",
+        ),
+        ("Okay Linear Algebra", "stop", "Okay Linear Algebra"),
+    ],
+)
+def test_complete_name_lines_are_kept(
+    reply: str, finish_reason: str, expected: str
+) -> None:
+    from dite.cluster.api import generate_cluster_name
+
+    name = generate_cluster_name(
+        _ReplyClient(reply, finish_reason=finish_reason),
+        None,
+        ["Matrix Rank Notes\nRank-nullity theorem."],
+        ["rank.txt"],
+        config=Config(),
+        llm_model="dummy-model",
+    )
+
+    assert name == expected
 
 
 @pytest.mark.parametrize("module_name", ["dite.cluster.api", "dite.cluster.name"])
@@ -635,7 +733,7 @@ def test_reasoning_only_naming_replies_warn_with_hint(capsys) -> None:
 
     output = _flat(capsys.readouterr().out)
     assert "heuristic names for 3 of 3 clusters" in output
-    assert "empty or reasoning-only reply: 3" in output
+    assert "empty, reasoning-only or cut-off reply: 3" in output
     assert "api.reasoning_param_style" in output
 
 

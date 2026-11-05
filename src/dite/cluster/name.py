@@ -69,6 +69,8 @@ _CLUSTER_NAME_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 _REASONING_TAG_RE = re.compile(r"</?think(?:ing)?\b", re.IGNORECASE)
+# Chat-template tokens such as "<|im_end|>" that a server failed to skip.
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[^<>|]*\|>")
 
 # Why a cluster kept a heuristic name instead of the model's answer.
 _FALLBACK_FAILED = "failed"
@@ -183,11 +185,22 @@ def _cluster_name_from_reply(content: str) -> str:
     Reasoning blocks, Markdown emphasis and "Name:" style labels are removed;
     the result may still be invalid and must go through the usual checks.
     """
-    answer = strip_reasoning_text(content)
+    answer = _SPECIAL_TOKEN_RE.sub(" ", strip_reasoning_text(content))
     first_line = next((line for line in answer.splitlines() if line.strip()), "")
-    name = _normalize_cluster_name_text(first_line)
+    name = _normalize_cluster_name_text(first_line.replace("**", ""))
     name = _CLUSTER_NAME_LABEL_RE.sub("", name, count=1)
     return _normalize_cluster_name_text(name.rstrip("*"))
+
+
+def _is_cut_off_name_reply(answer: str, finish_reason: str | None) -> bool:
+    """Return whether ``max_tokens`` ended the reply inside its first line.
+
+    Chat templates that open ``<think>`` in the prompt (QwQ, DeepSeek-R1
+    distills, Qwen3 Thinking models) leave the reasoning untagged, so a reply
+    cut off inside it reads like prose ("Okay, the user wants me to"). A name
+    followed by a line break is complete and stays usable.
+    """
+    return finish_reason == "length" and "\n" not in answer
 
 
 def _fallback_name_from_file_name(file_name: str) -> str:
@@ -378,6 +391,12 @@ def generate_cluster_name(
                 fallback = _heuristic_cluster_name(sample_contents, sample_names)
                 logger.debug(t("debug_cluster_name_empty_fallback", fallback=fallback))
                 return _ClusterName(fallback, _FALLBACK_EMPTY)
+            if _is_cut_off_name_reply(answer, getattr(choice, "finish_reason", None)):
+                fallback = _heuristic_cluster_name(sample_contents, sample_names)
+                logger.debug(
+                    t("debug_cluster_name_cut_off_fallback", fallback=fallback)
+                )
+                return _ClusterName(fallback, _FALLBACK_EMPTY)
 
             name = _cluster_name_from_reply(answer)
             if _is_invalid_cluster_name(name):
@@ -450,6 +469,10 @@ def _cluster_name_from_async_response(
         logger.debug(
             t("debug_cluster_name_async_response_empty", fallback=fallback, **timing)
         )
+        return _ClusterName(fallback, _FALLBACK_EMPTY)
+    if _is_cut_off_name_reply(answer, response.finish_reason):
+        fallback = _heuristic_cluster_name(selected_contents, selected_names)
+        logger.debug(t("debug_cluster_name_cut_off_fallback", fallback=fallback))
         return _ClusterName(fallback, _FALLBACK_EMPTY)
 
     name = _cluster_name_from_reply(answer)
