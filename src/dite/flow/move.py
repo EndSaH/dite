@@ -430,14 +430,26 @@ _TERMINATION_SIGNALS = tuple(
 
 _held_back = 0  # depth of _Uninterrupted sections
 _interrupt_pending = False
+_interrupt_raised = False  # the run is already stopping
 
 
 def _raise_interrupt(signum: int, frame: Any) -> None:
-    """Signal handler: ``KeyboardInterrupt``, after any ``_Uninterrupted``."""
-    global _interrupt_pending
+    """Signal handler: ``KeyboardInterrupt``, after any ``_Uninterrupted``.
+
+    It raises at most once per run. Once the run is stopping, a further
+    signal (a second Ctrl-C, or a SIGTERM that follows a SIGINT) has nothing
+    to add, and raising it would cut short the cleanup of the step in
+    progress, as the first ``KeyboardInterrupt`` unwinds, before any
+    ``_Uninterrupted`` section can be entered. ``kill -9`` still ends a
+    cleanup that hangs.
+    """
+    global _interrupt_pending, _interrupt_raised
+    if _interrupt_raised:
+        return
     if _held_back:
         _interrupt_pending = True
         return
+    _interrupt_raised = True
     raise KeyboardInterrupt
 
 
@@ -452,10 +464,11 @@ class _Uninterrupted:
         _held_back += 1
 
     def __exit__(self, *exc_info: object) -> None:
-        global _held_back, _interrupt_pending
+        global _held_back, _interrupt_pending, _interrupt_raised
         _held_back -= 1
         if not _held_back and _interrupt_pending:
             _interrupt_pending = False
+            _interrupt_raised = True
             raise KeyboardInterrupt
 
 
@@ -472,8 +485,9 @@ def _interrupt_on_termination() -> Iterator[None]:
     installed is left alone, and so is everything outside the main thread,
     the only one that may set handlers.
     """
-    global _interrupt_pending
+    global _interrupt_pending, _interrupt_raised
     _interrupt_pending = False
+    _interrupt_raised = False
     previous: dict[int, Any] = {}
     for signum in (signal.SIGINT, *_TERMINATION_SIGNALS):
         default = (
@@ -563,8 +577,10 @@ class _NewName:
 
     def discard(self) -> None:
         """Remove the name if it was made; never more than once."""
-        # A second Ctrl-C must not cut this short: the name would stay
-        # behind as a duplicate that no journal knows about.
+        # Nothing may cut this short, or the name stays behind as a
+        # duplicate that no journal knows about. A second signal cannot:
+        # _raise_interrupt raises only once per run. The section holds back
+        # the first one when discard runs before any interrupt was raised.
         with _Uninterrupted():
             if self.created and self.path is not None:
                 self.created = False
@@ -655,6 +671,10 @@ def _copy_new(source: Path, destination: Path, new_name: _NewName) -> None:
                 raise OSError(t("error_copy_failed"))
         shutil.copystat(source, partial)
         _name_copy(partial, destination, new_name)
+        # Drop the extra name here, not only in ``finally``: an interrupt
+        # that lands before it is gone then still takes the except branch.
+        with suppress(FileNotFoundError):
+            os.unlink(partial)  # already gone after a rename
         # The new name must be on disk before the source can be deleted.
         _fsync_directory(destination.parent)
     except BaseException:
@@ -1170,6 +1190,9 @@ def _undo_move(entry: JournalMove, *, dry_run: bool) -> tuple[Path, str] | None:
         return source, "conflict"
     except OSError as exc:
         return destination, str(exc)
+    except BaseException:
+        new_name.discard()  # as in _move_file: an interrupt as the name is made
+        raise
     try:
         os.unlink(destination)
     except OSError as exc:

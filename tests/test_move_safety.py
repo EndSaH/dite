@@ -566,6 +566,126 @@ def test_ctrl_c_again_during_the_cleanup_still_removes_the_new_name(
     assert _organized_files(preview.target_folder) == []
 
 
+def _second_signal_as_discard_starts(monkeypatch) -> None:
+    """Send a real SIGINT just before ``_NewName.discard`` runs.
+
+    The handler runs as the real ``discard`` is called, before its
+    ``_Uninterrupted`` section is entered: the window a second signal that
+    arrives while the first ``KeyboardInterrupt`` unwinds falls into.
+    """
+    real_discard = move_module._NewName.discard
+
+    def discard(self):
+        if self.created:
+            signal.raise_signal(signal.SIGINT)
+        return real_discard(self)
+
+    monkeypatch.setattr(move_module._NewName, "discard", discard)
+
+
+def test_second_signal_as_the_cleanup_starts_leaves_no_unrecorded_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = _write(tmp_path / "src" / "a.txt", "payload")
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", [source])
+    real_record_move = move_module.MoveJournal.record_move
+
+    def record_move(self, *args, **kwargs):
+        signal.raise_signal(signal.SIGINT)  # the first signal, as the move is journaled
+        return real_record_move(self, *args, **kwargs)
+
+    monkeypatch.setattr(move_module.MoveJournal, "record_move", record_move)
+    _second_signal_as_discard_starts(monkeypatch)
+    with pytest.raises(KeyboardInterrupt):
+        _execute(preview)
+    monkeypatch.undo()
+
+    assert source.read_text(encoding="utf-8") == "payload"
+    assert _organized_files(preview.target_folder) == []
+    while (journal := find_latest_journal(preview.target_folder)) is not None:
+        undo_journal(journal)
+    assert sorted(
+        path.relative_to(preview.target_folder).as_posix()
+        for path in preview.target_folder.rglob("*")
+        if JOURNAL_DIR_NAME not in path.parts
+    ) == []
+
+
+def test_second_signal_during_an_undo_without_hard_links_leaves_no_claim_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = _write(tmp_path / "src" / "a.txt", "payload")
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", [source])
+    monkeypatch.setattr(os, "link", _no_link)
+    _execute(preview)
+    assert not source.exists()
+    real_open = os.open
+
+    def open_(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if os.fspath(path) == os.fspath(source) and flags & os.O_EXCL:
+            signal.raise_signal(signal.SIGINT)  # first signal: the name is claimed
+        return fd
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", open_)
+        _second_signal_as_discard_starts(patch)
+        with pytest.raises(KeyboardInterrupt):
+            undo_journal(preview.journal_path)
+
+    # No empty file was left at the original path to be taken for a conflict.
+    assert not source.exists()
+    result = undo_journal(find_latest_journal(preview.target_folder))
+    assert result.skipped == []
+    assert source.read_text(encoding="utf-8") == "payload"
+    assert read_journal(preview.journal_path).undone
+
+
+def test_ctrl_c_as_the_partial_copy_is_removed_leaves_no_partial_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = _write(tmp_path / "src" / "a.txt", "payload")
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", [source])
+    source_folder = os.fspath(tmp_path / "src")
+    real_link, real_unlink = os.link, os.unlink
+    sent = []
+
+    def link(existing, new, *args, **kwargs):
+        if os.fspath(existing).startswith(source_folder):  # as across file systems
+            raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+        return real_link(existing, new, *args, **kwargs)
+
+    def unlink(path, *args, **kwargs):
+        if Path(path).name.startswith(".dite-partial-") and not sent:
+            sent.append(path)
+            signal.raise_signal(signal.SIGINT)  # after the copy got its name
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", link)
+    monkeypatch.setattr(os, "unlink", unlink)
+    with pytest.raises(KeyboardInterrupt):
+        _execute(preview)
+    monkeypatch.undo()
+
+    assert sent
+    assert source.read_text(encoding="utf-8") == "payload"
+    left = sorted(
+        path.relative_to(preview.target_folder).as_posix()
+        for path in preview.target_folder.rglob("*")
+        if JOURNAL_DIR_NAME not in path.parts and path.is_file()
+    )
+    assert left == []  # neither the partial file nor an unrecorded copy
+
+
 class _WithoutInodeNumber:
     """``os.lstat`` of a file system that reports st_ino 0 for every file."""
 
