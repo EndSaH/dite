@@ -372,11 +372,7 @@ class OrganizePreview:
             # 创建目录
             for cluster_name in self.cluster_map:
                 dest_dir = self.target_folder / cluster_name
-                created = _missing_ancestors(dest_dir)
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                if journal is not None:
-                    for directory in created:
-                        journal.record_mkdir(directory)
+                _make_folder(dest_dir, journal)
                 _remove_partials(dest_dir)
 
             # Every planned name, so a late rename cannot take another
@@ -392,12 +388,7 @@ class OrganizePreview:
                     failed += 1
                     continue
                 try:
-                    created = _missing_ancestors(op.destination.parent)
-                    op.destination.parent.mkdir(parents=True, exist_ok=True)
-                    if journal is not None:
-                        for directory in created:
-                            journal.record_mkdir(directory)
-
+                    _make_folder(op.destination.parent, journal)
                     _move_file(op, journal, taken)
                     op.status = "success"
                     success += 1
@@ -753,6 +744,19 @@ def _remove_partials(directory: Path) -> None:
             with suppress(OSError):
                 if stat.S_ISREG(os.lstat(path).st_mode):
                     os.unlink(path)
+
+
+def _make_folder(directory: Path, journal: MoveJournal | None) -> None:
+    """Create ``directory`` and its missing parents, journaling each first.
+
+    As with a move, the record comes before the change: an interrupt or a
+    full disk can leave a record of a folder that was never made (undo's
+    rmdir then finds nothing), but never a folder undo does not know about.
+    """
+    if journal is not None:
+        for missing in _missing_ancestors(directory):
+            journal.record_mkdir(missing)
+    directory.mkdir(parents=True, exist_ok=True)
 
 
 def _missing_ancestors(directory: Path) -> list[Path]:

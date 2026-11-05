@@ -496,6 +496,33 @@ def _ctrl_c_on_journal_fsync(monkeypatch, journal_dir: Path, record: int) -> Non
     monkeypatch.setattr(os, "fsync", fsync)
 
 
+def test_ctrl_c_as_a_folder_is_journaled_leaves_no_unrecorded_folder(
+    tmp_path: Path, monkeypatch
+) -> None:
+    first = _write(tmp_path / "src" / "a.txt", "a")
+    second = _write(tmp_path / "src" / "b.txt", "b")
+    target = tmp_path / "out"
+    preview = OrganizePreview(source_folder=tmp_path / "src", target_folder=target)
+    preview.add_cluster("One", [first])
+    preview.add_cluster("Two", [second])
+    # The records are the header, the folder One, then the folder Two.
+    _ctrl_c_on_journal_fsync(monkeypatch, target / JOURNAL_DIR_NAME, 3)
+
+    with pytest.raises(KeyboardInterrupt):
+        _execute(preview)
+    monkeypatch.undo()
+
+    recorded = set(read_journal(preview.journal_path).created_dirs)
+    folders = {path.resolve() for path in target.iterdir()}
+    assert folders - {(target / JOURNAL_DIR_NAME).resolve()} <= recorded
+
+    undo_journal(preview.journal_path)
+
+    assert [path.name for path in target.iterdir()] == [JOURNAL_DIR_NAME]
+    assert first.read_text(encoding="utf-8") == "a"
+    assert second.read_text(encoding="utf-8") == "b"
+
+
 class _NearlyFullFile(io.FileIO):
     """A file on a disk with ``room`` bytes left; writing more raises ENOSPC."""
 
