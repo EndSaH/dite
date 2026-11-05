@@ -736,3 +736,32 @@ def test_cli_undo_closes_a_journal_once_only_final_skips_remain(
     assert read_journal(preview.journal_path).undone is True
     assert find_latest_journal(preview.target_folder) is None
     assert files[1].read_text(encoding="utf-8") == "placeholder"
+
+
+def test_cli_undo_moves_nothing_back_when_closing_a_journal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _write_cli_config(tmp_path, monkeypatch)
+    preview, files = _organize(tmp_path, ["a.txt"])
+    moved = preview.operations[0].destination
+    elsewhere = tmp_path / "elsewhere.txt"
+    os.link(moved, elsewhere)
+    moved.unlink()
+    real_undo = move_module.undo_journal
+
+    def file_returns_after_the_plan(path, *, dry_run=False):
+        result = real_undo(path, dry_run=dry_run)
+        if dry_run:
+            # The plan said nothing can be moved back; then the file is back.
+            os.link(elsewhere, moved)
+        return result
+
+    monkeypatch.setattr(move_module, "undo_journal", file_returns_after_the_plan)
+
+    # No --yes and no answer: nothing the user did not confirm may move.
+    result = CliRunner().invoke(app, ["undo", str(preview.target_folder)])
+
+    assert result.exit_code == 0, result.output
+    assert moved.read_text(encoding="utf-8") == "payload 0"
+    assert not files[0].exists()
+    assert read_journal(preview.journal_path).undone is True

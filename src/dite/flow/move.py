@@ -873,6 +873,20 @@ def undo_journal(journal_path: Path, *, dry_run: bool = False) -> UndoResult:
     return result
 
 
+def close_journal(journal_path: Path, *, skipped: int) -> None:
+    """Mark a journal undone without touching any file or directory.
+
+    For a journal whose remaining moves can no longer be undone (all
+    ``missing`` or ``changed``), so that undoing the target goes on to the
+    run before it without moving anything the user has not confirmed.
+    """
+    journal = MoveJournal.reopen(journal_path)
+    try:
+        journal.record_undone(restored=0, skipped=skipped)
+    finally:
+        journal.close()
+
+
 def _undo_move(entry: JournalMove, *, dry_run: bool) -> tuple[Path, str] | None:
     """Move one file back; returns ``(path, reason)`` when it is skipped."""
     source, destination = entry.source, entry.destination

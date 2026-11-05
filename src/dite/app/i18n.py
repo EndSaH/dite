@@ -461,7 +461,8 @@ ZH_CN = Messages(
     undo_skipped_missing="跳过（整理后的文件已不存在）: {path}",
     undo_skipped_conflict="跳过（原位置已有同名文件）: {path}",
     undo_skipped_changed=(
-        "跳过（整理后的文件已被修改或替换，不是当初移过去的那个）: {path}"
+        "跳过（整理后的文件已被修改或替换，不是当初移过去的那个；"
+        "它留在当前位置，需要的话请手动移回）: {path}"
     ),
     assign_description="把新文件归入已有的子文件夹",
     cli_help_folder_assign="包含新文件的文件夹",
@@ -905,7 +906,8 @@ EN = Messages(
         "Skipped (a file already exists at the original location): {path}"
     ),
     undo_skipped_changed=(
-        "Skipped (the moved file was changed or replaced since the move): {path}"
+        "Skipped (the moved file was changed or replaced since the move; it "
+        "stays where it is, move it back by hand if you want): {path}"
     ),
     assign_description="Sort new files into existing subfolders",
     cli_help_folder_assign="Folder that contains the new files",

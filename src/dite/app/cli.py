@@ -1036,7 +1036,12 @@ def undo(
     """Undo the file moves recorded by organize/assign --execute."""
     from rich.markup import escape
 
-    from dite.flow.move import find_latest_journal, read_journal, undo_journal
+    from dite.flow.move import (
+        close_journal,
+        find_latest_journal,
+        read_journal,
+        undo_journal,
+    )
 
     logger = get_logger()
     journal_path = path if path.is_file() else find_latest_journal(path)
@@ -1073,8 +1078,9 @@ def undo(
     if not plan.restored:
         if not plan.retryable:
             # Nothing a retry could move back: close the journal so the next
-            # `dite undo` goes on to the run before this one.
-            undo_journal(journal_path)
+            # `dite undo` goes on to the run before this one. Nothing was
+            # confirmed, so no file is touched.
+            close_journal(journal_path, skipped=len(plan.skipped))
         logger.success(t("undo_done", restored=0, skipped=len(plan.skipped)))
         _print_undo_retry_hint(logger, plan, path)
         return
