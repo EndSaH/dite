@@ -1,8 +1,11 @@
 """Per-file failure isolation and Ctrl+C handling in the extraction stage."""
 
 import asyncio
+import concurrent.futures
 import functools
+import signal
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -550,6 +553,62 @@ def test_extract_stage_tells_running_files_to_stop_after_keyboard_interrupt(
         _run_stage(files, runner, workers=2)
 
     assert outcome == {"saw_cancellation": True}
+    assert time.monotonic() - started < 3
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_kill"), reason="needs signal.pthread_kill"
+)
+def test_extract_stage_stops_on_a_real_sigint_while_waiting_for_workers(
+    tmp_path: Path,
+) -> None:
+    from dite.util.cancel import cancellation_requested
+
+    files = _write_files(tmp_path, ["a.txt", "b.txt"])
+    main_thread_id = threading.main_thread().ident
+    waiting_codes = {
+        concurrent.futures.wait.__code__,
+        concurrent.futures.as_completed.__code__,
+    }
+    outcome: dict[str, bool] = {}
+
+    def main_thread_is_waiting_for_workers() -> bool:
+        # Not merely inside executor.submit(), which also waits while it
+        # starts a worker thread.
+        frame = sys._current_frames().get(main_thread_id)
+        while frame is not None:
+            if frame.f_code in waiting_codes:
+                return True
+            frame = frame.f_back
+        return False
+
+    def runner(item, options, truncate_limit, semaphore):
+        del options, truncate_limit, semaphore
+        if item.file.name == "a.txt":
+            # Ctrl+C: the terminal sends SIGINT, which the main thread gets
+            # while it waits for the running files.
+            deadline = time.monotonic() + 5
+            while not main_thread_is_waiting_for_workers():
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            signal.pthread_kill(main_thread_id, signal.SIGINT)
+        deadline = time.monotonic() + 5
+        while not cancellation_requested() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        outcome[item.file.name] = cancellation_requested()
+        return _ok_result(item)
+
+    previous_handler = signal.signal(signal.SIGINT, signal.default_int_handler)
+    started = time.monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _run_stage(files, runner, workers=2)
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
+
+    # Both running files were told to stop, and the stage did not wait out
+    # their 5 s.
+    assert outcome == {"a.txt": True, "b.txt": True}
     assert time.monotonic() - started < 3
 
 

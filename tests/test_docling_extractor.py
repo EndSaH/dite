@@ -657,9 +657,14 @@ def test_docling_pdf_child_leaves_ctrl_c_to_the_parent(monkeypatch) -> None:
     from dite.io.docling import _run_docling_pdf_child
 
     events: list[object] = []
+    # Replace the module docling.py sees, not the stdlib's own signal.signal.
     monkeypatch.setattr(
-        "dite.io.docling.signal.signal",
-        lambda signum, handler: events.append((signum, handler)),
+        "dite.io.docling.signal",
+        SimpleNamespace(
+            signal=lambda signum, handler: events.append((signum, handler)),
+            SIGINT=signal.SIGINT,
+            SIG_IGN=signal.SIG_IGN,
+        ),
     )
 
     _run_docling_pdf_child(lambda *args: events.append(args), "a.pdf", False)
