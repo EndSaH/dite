@@ -619,6 +619,40 @@ def test_extract_docling_pdf_in_subprocess_starts_no_child_once_cancelled(
         )
 
 
+def test_extract_docling_pdf_in_subprocess_closes_the_pipe_if_the_child_fails_to_start(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class _Conn:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _Process:
+        def __init__(self, target, args) -> None:
+            del target, args
+
+        def start(self) -> None:
+            raise OSError(24, "Too many open files")
+
+        def is_alive(self) -> bool:
+            return False
+
+    pipe = (_Conn(), _Conn())
+    context = SimpleNamespace(Pipe=lambda duplex: pipe, Process=_Process)
+    monkeypatch.setattr(
+        "dite.io.docling.multiprocessing",
+        SimpleNamespace(get_context=lambda method: context),
+    )
+
+    with pytest.raises(OSError, match="Too many open files"):
+        extract_docling_pdf_in_subprocess(
+            tmp_path / "paper.pdf", timeout_sec=30, locale="en"
+        )
+
+    assert [conn.closed for conn in pipe] == [True, True]
+
+
 def test_docling_pdf_child_leaves_ctrl_c_to_the_parent(monkeypatch) -> None:
     from dite.io.docling import _run_docling_pdf_child
 

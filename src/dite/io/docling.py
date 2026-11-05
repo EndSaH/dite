@@ -246,6 +246,9 @@ def extract_docling_pdf_in_subprocess(
         # the child running or unreaped.
         if started and process.is_alive():
             _stop_process(process)
+        # Already closed once the child has started; this covers a start()
+        # that raised. Closing a connection twice does nothing.
+        child_conn.close()
         parent_conn.close()
 
 
