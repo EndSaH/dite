@@ -1,6 +1,7 @@
 """Per-file failure isolation and Ctrl+C handling in the extraction stage."""
 
 import asyncio
+import functools
 import sqlite3
 import threading
 import time
@@ -13,7 +14,7 @@ from typer.testing import CliRunner
 from dite.app.cli import app
 from dite.app.config import Config
 from dite.app.i18n import set_locale
-from dite.cache import FileCache
+from dite.cache import VLM_CACHE_VERSION, FileCache
 from dite.flow.api import PipelineOptions, PipelineService
 from dite.flow.extract import extract_stage
 from dite.flow.model import (
@@ -27,6 +28,7 @@ from dite.io.pdf.render import PDFRenderResult
 from dite.io.pdf.vlm import extract_pdf_with_vlm_sampling
 from dite.io.types import ResolvedExtraction
 from dite.util.api import AsyncRequestRuntime
+from dite.util.hash import compute_file_hash
 from dite.util.log import get_logger, setup_logging
 
 
@@ -208,6 +210,7 @@ def test_pipeline_records_unreadable_files_as_failed_without_extracting_them(
 
 
 _CACHE_CALL_ORDER = ["get_content", "get_vlm_content", "save", "update_vlm_content"]
+_CACHE_READS = {"get_content", "get_vlm_content"}
 
 
 def _fake_pdf_primary_result(self, file_path, registry, docling_pdf_semaphore):
@@ -288,13 +291,101 @@ def test_pipeline_keeps_extracted_content_when_the_cache_fails(
     assert [report.primary_success for report in reports] == [True, True]
     assert [report.primary_error for report in reports] == [None, None]
     assert summary.primary_failures == 0
-    # After its first cache error a file leaves the cache alone.
-    skipped = _CACHE_CALL_ORDER[_CACHE_CALL_ORDER.index(failing) + 1 :]
+    # After a cache error a file still makes its other lookup, but writes
+    # nothing more.
+    later = _CACHE_CALL_ORDER[_CACHE_CALL_ORDER.index(failing) + 1 :]
+    still_made = [method for method in later if method in _CACHE_READS]
+    skipped = [method for method in later if method not in _CACHE_READS]
     assert calls.count(failing) == 2
+    for method in still_made:
+        assert calls.count(method) == 2, calls
     assert not set(calls) & set(skipped), calls
     output = " ".join(capsys.readouterr().out.split())
     assert output.count("Cache read/write failed for") == 2
     assert output.count("OperationalError: database is locked") == 2
+
+
+def _fake_resolve_preferring_cached_vlm(file_path, client, **kwargs):
+    """A weak PDF: its cached VLM text if there is any, else a paid request."""
+    del client
+    primary = kwargs["primary_result"]
+    cached = kwargs["cached_vlm_content"]
+    vlm_text = cached or f"{file_path.stem} fresh vlm text"
+    return ResolvedExtraction(
+        primary_result=primary,
+        primary_effective_length=len(primary.content),
+        pdf_profile=None,
+        fallback_needed=True,
+        selected_source="vlm_cache" if cached else "vlm_api",
+        final_content=vlm_text,
+        final_effective_length=len(vlm_text),
+        vlm_content=vlm_text,
+        vlm_source="cache" if cached else "api",
+        vlm_api_success=not cached,
+        vlm_api_page_calls=0 if cached else 1,
+        sample_page_limit=10,
+        cache_write_intent=PDFCacheWriteIntent(
+            should_write=not cached, content=None if cached else vlm_text
+        ),
+    )
+
+
+@_ENTRY_POINTS
+def test_pipeline_still_uses_the_vlm_cache_when_the_content_lookup_fails(
+    tmp_path: Path, monkeypatch, capsys, extract
+) -> None:
+    set_locale("en")
+    setup_logging()
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(b"%PDF-1.7 a.pdf")
+    cache = FileCache(db_path=tmp_path / "cache" / "cache.db")
+    cache.update_vlm_content(
+        pdf,
+        compute_file_hash(pdf),
+        "a cached vlm text",
+        VLM_CACHE_VERSION,
+        enforce_size_limit=False,
+    )
+    writes: list[str] = []
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    def record_write(*args, _method, **kwargs):
+        writes.append(_method)
+
+    monkeypatch.setattr(cache, "get_content", locked)
+    for method in ["save", "update_vlm_content"]:
+        monkeypatch.setattr(
+            cache, method, functools.partial(record_write, _method=method)
+        )
+    monkeypatch.setattr(
+        PipelineService, "_extract_primary_result", _fake_pdf_primary_result
+    )
+    monkeypatch.setattr(
+        "dite.flow.api.resolve_document_extraction",
+        _fake_resolve_preferring_cached_vlm,
+    )
+    service = PipelineService(client=object(), config=Config(), cache=cache)
+
+    try:
+        contents, reports, summary = extract(
+            service,
+            [pdf],
+            PipelineOptions(use_cache=True, use_embedding_cache=False),
+        )
+    finally:
+        cache.close()
+
+    # The failed Docling-text lookup does not cost the paid VLM text.
+    assert contents == ["a cached vlm text"]
+    assert reports[0].primary_success is True
+    assert summary.vlm_cache_hits == 1
+    assert summary.vlm_api_page_calls == 0
+    # A cache that just failed is not written to again for this file.
+    assert writes == []
+    output = " ".join(capsys.readouterr().out.split())
+    assert output.count("Cache read/write failed for") == 1
 
 
 @_ENTRY_POINTS

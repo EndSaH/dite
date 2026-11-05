@@ -83,24 +83,37 @@ _CACHE_ERRORS = (sqlite3.Error, OSError)
 class BestEffortCache:
     """Cache access for one file that never fails the file.
 
-    The cache only saves work. When a lookup or a write raises, a warning is
-    logged, the cache is left alone for the rest of this file, and the file is
-    extracted and keeps its content as if it had no cache.
+    The cache only saves work. When a call raises, a warning is logged once for
+    the file, the call counts as a miss, and the file is extracted and keeps its
+    content as if it had no cache. The file still makes its other lookups, since
+    a VLM cache hit saves a paid request, but writes nothing more: a write to a
+    database that is in trouble can hold the write lock for the whole busy
+    timeout, and every reader waits meanwhile.
     """
 
     def __init__(self, cache, *, enabled: bool, file: Path, logger) -> None:
         self._cache = cache if enabled and cache else None
         self._file = file
         self._logger = logger
+        self._failed = False
 
     @property
     def available(self) -> bool:
         return self._cache is not None
 
-    def run[T](self, operation: Callable[[FileCache], T], default: T) -> T:
-        """Return ``operation(cache)``, or ``default`` if the cache is unusable."""
+    def read[T](self, operation: Callable[[FileCache], T], default: T) -> T:
+        """Return ``operation(cache)``, or ``default`` if the lookup fails."""
         if self._cache is None:
             return default
+        return self._call(operation, default)
+
+    def write(self, operation: Callable[[FileCache], object]) -> None:
+        """Run ``operation(cache)`` unless a cache call for this file failed."""
+        if self._cache is None or self._failed:
+            return
+        self._call(operation, None)
+
+    def _call[T](self, operation: Callable[[FileCache], T], default: T) -> T:
         try:
             return operation(self._cache)
         except _CACHE_ERRORS as exc:
@@ -109,14 +122,15 @@ class BestEffortCache:
             # locked for every other thread and process.
             with contextlib.suppress(sqlite3.Error):
                 self._cache.rollback()
-            self._cache = None
-            self._logger.warning(
-                t(
-                    "warning_extract_cache_failed",
-                    path=escape(str(self._file)),
-                    error=escape(_describe_error(exc)),
+            if not self._failed:
+                self._failed = True
+                self._logger.warning(
+                    t(
+                        "warning_extract_cache_failed",
+                        path=escape(str(self._file)),
+                        error=escape(_describe_error(exc)),
+                    )
                 )
-            )
             return default
 
 
@@ -189,7 +203,7 @@ def extract_content_work_item(
     )
 
     if item_cache.available:
-        cached_primary_content, source_file = item_cache.run(
+        cached_primary_content, source_file = item_cache.read(
             lambda cache: cache.get_content(file, file_hash), (None, None)
         )
         if cached_primary_content:
@@ -217,7 +231,7 @@ def extract_content_work_item(
             logger.debug(t("debug_extract_doc_cache_miss"))
 
     if file.suffix.lower() == ".pdf" and item_cache.available:
-        cached_vlm_content = item_cache.run(
+        cached_vlm_content = item_cache.read(
             lambda cache: cache.get_vlm_content(file, file_hash, VLM_CACHE_VERSION),
             None,
         )
@@ -261,7 +275,7 @@ def extract_content_work_item(
     )
 
     if item_cache.available and resolved.primary_result.success and doc_cache_hits == 0:
-        item_cache.run(
+        item_cache.write(
             lambda cache: cache.save(
                 file_path=file,
                 file_hash=file_hash,
@@ -269,8 +283,7 @@ def extract_content_work_item(
                 content_md=resolved.primary_result.content,
                 model_version=config.models.embedding,
                 enforce_size_limit=False,
-            ),
-            None,
+            )
         )
 
     if (
@@ -278,15 +291,14 @@ def extract_content_work_item(
         and resolved.cache_write_intent.content
         and item_cache.available
     ):
-        item_cache.run(
+        item_cache.write(
             lambda cache: cache.update_vlm_content(
                 file,
                 file_hash,
                 resolved.cache_write_intent.content,
                 VLM_CACHE_VERSION,
                 enforce_size_limit=False,
-            ),
-            None,
+            )
         )
 
     from dite.doc.embed import ContentTruncator

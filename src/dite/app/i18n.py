@@ -684,9 +684,7 @@ ZH_CN = Messages(
     warning_unsupported_file_format="不支持的文件格式: {suffix}",
     warning_extractor_failed="{extractor} 处理 {name} 失败: {error}",
     warning_extract_file_failed="提取 {path} 失败，继续处理其他文件: {error}",
-    warning_extract_cache_failed=(
-        "读写 {path} 的缓存失败，该文件不再使用缓存，提取结果照常保留: {error}"
-    ),
+    warning_extract_cache_failed="读写 {path} 的缓存失败，提取结果照常保留: {error}",
     warning_pdf2image_missing="pdf2image 未安装，无法使用 VLM 回退",
     warning_vlm_fallback_failed="VLM 回退处理失败: {error}",
     warning_analyzer_default_used="文档分析失败，使用默认值",
@@ -1142,8 +1140,7 @@ EN = Messages(
         "Extraction failed for {path}; continuing with the other files: {error}"
     ),
     warning_extract_cache_failed=(
-        "Cache read/write failed for {path}; continuing without the cache for "
-        "this file: {error}"
+        "Cache read/write failed for {path}; its extracted content is kept: {error}"
     ),
     warning_pdf2image_missing="pdf2image is not installed, cannot use VLM fallback",
     warning_vlm_fallback_failed="VLM fallback failed: {error}",

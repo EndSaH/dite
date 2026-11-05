@@ -201,7 +201,7 @@ class PipelineService:
         )
 
         if item_cache.available:
-            cached_primary_content, source_file = item_cache.run(
+            cached_primary_content, source_file = item_cache.read(
                 lambda cache: cache.get_content(file, file_hash), (None, None)
             )
             if cached_primary_content:
@@ -229,7 +229,7 @@ class PipelineService:
                 self.logger.debug(t("debug_extract_doc_cache_miss"))
 
         if file.suffix.lower() == ".pdf" and item_cache.available:
-            cached_vlm_content = item_cache.run(
+            cached_vlm_content = item_cache.read(
                 lambda cache: cache.get_vlm_content(
                     file,
                     file_hash,
@@ -287,7 +287,7 @@ class PipelineService:
             and resolved.primary_result.success
             and doc_cache_hits == 0
         ):
-            item_cache.run(
+            item_cache.write(
                 lambda cache: cache.save(
                     file_path=file,
                     file_hash=file_hash,
@@ -295,8 +295,7 @@ class PipelineService:
                     content_md=resolved.primary_result.content,
                     model_version=self.config.models.embedding,
                     enforce_size_limit=False,
-                ),
-                None,
+                )
             )
 
         if (
@@ -304,15 +303,14 @@ class PipelineService:
             and resolved.cache_write_intent.content
             and item_cache.available
         ):
-            item_cache.run(
+            item_cache.write(
                 lambda cache: cache.update_vlm_content(
                     file,
                     file_hash,
                     resolved.cache_write_intent.content,
                     VLM_CACHE_VERSION,
                     enforce_size_limit=False,
-                ),
-                None,
+                )
             )
 
         if len(resolved.final_content) > truncate_limit:
