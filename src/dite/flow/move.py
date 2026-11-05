@@ -422,26 +422,54 @@ def _move_file(op: FileOperation, journal: MoveJournal | None, taken: set[str]) 
     """Move ``op.source`` to ``op.destination`` (or the next free name).
 
     The new name is created first and journaled, and only then is the source
-    deleted, so an interruption leaves at worst a second name for a file the
-    journal knows about, never a moved file that undo cannot find. When the
-    source cannot be deleted the new name is removed again.
+    deleted, so an error or Ctrl-C leaves at worst a second name for a file
+    the journal knows about, never a moved file that undo cannot find. The
+    new name is removed again only while the source is known to be there:
+    when the journal write fails, or when deleting the source fails and the
+    source still exists. A process killed (or a machine losing power) between
+    creating the new name and the journal write can still leave that name
+    behind unrecorded, next to the untouched source.
     """
     op.destination = _create_unique(op.source, op.destination, taken)
     move_id: int | None = None
-    try:
-        if journal is not None:
-            move_id = journal.record_move(op.source, op.destination)
-        os.unlink(op.source)
-    except BaseException:
+    if journal is not None:
         try:
-            os.unlink(op.destination)
-        except OSError:
-            pass  # both names stay; undo drops the recorded duplicate
-        else:
-            if journal is not None and move_id is not None:
-                with suppress(OSError):
-                    journal.record_cancel(move_id)
+            move_id = journal.record_move(op.source, op.destination)
+        except BaseException:
+            # The source is untouched, so the new name is only a duplicate.
+            with suppress(OSError):
+                os.unlink(op.destination)
+            raise
+    try:
+        os.unlink(op.source)
+    except OSError:
+        # Only OSError is handled: a Ctrl-C can arrive once the unlink has
+        # already removed the source, and then the new name is the only one
+        # left. Even after an OSError the source may be gone, so look first.
+        source_exists = _lexists_or_none(op.source)
+        if source_exists is False:
+            return  # deleted after all (a retried network unlink, say)
+        if source_exists:
+            try:
+                os.unlink(op.destination)
+            except OSError:
+                pass  # both names stay; undo drops the recorded duplicate
+            else:
+                if journal is not None and move_id is not None:
+                    with suppress(OSError):
+                        journal.record_cancel(move_id)
         raise
+
+
+def _lexists_or_none(path: Path) -> bool | None:
+    """Whether ``path`` exists (even as a broken symlink); ``None`` if unknown."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    return True
 
 
 def _create_unique(source: Path, destination: Path, taken: set[str]) -> Path:

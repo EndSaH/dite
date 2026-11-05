@@ -387,6 +387,69 @@ def test_journal_records_each_move_before_the_source_is_deleted(
     assert seen_in_journal == [True]
 
 
+def _break_unlink_after_removing(monkeypatch, victim: Path, error: BaseException):
+    """Make deleting ``victim`` raise ``error`` once the file is already gone."""
+    real_unlink = os.unlink
+
+    def unlink(path, *args, **kwargs):
+        real_unlink(path, *args, **kwargs)
+        if os.fspath(path) == os.fspath(victim):
+            raise error
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    monkeypatch.setattr(os, "remove", unlink)
+
+
+def test_ctrl_c_right_after_the_source_delete_keeps_the_moved_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = _write(tmp_path / "src" / "thesis.pdf", "the only copy")
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", [source])
+    # CPython raises a pending SIGINT when the unlink call returns, that is
+    # after the source is already gone.
+    _break_unlink_after_removing(monkeypatch, source, KeyboardInterrupt())
+
+    with pytest.raises(KeyboardInterrupt):
+        _execute(preview)
+    monkeypatch.undo()
+
+    moved = preview.operations[0].destination
+    assert not source.exists()
+    assert moved.read_text(encoding="utf-8") == "the only copy"
+    pending = read_journal(preview.journal_path).pending
+    assert [(entry.source, entry.destination) for entry in pending] == [(source, moved)]
+
+    undo_journal(preview.journal_path)
+
+    assert source.read_text(encoding="utf-8") == "the only copy"
+
+
+def test_source_delete_error_after_the_file_is_gone_keeps_the_moved_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = _write(tmp_path / "src" / "a.txt", "payload")
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", [source])
+    # A network file system can report an error for an unlink it carried out.
+    _break_unlink_after_removing(
+        monkeypatch, source, OSError(errno.EIO, "Input/output error")
+    )
+
+    assert _execute(preview) == (1, 0)
+    monkeypatch.undo()
+
+    moved = preview.operations[0].destination
+    assert moved.read_text(encoding="utf-8") == "payload"
+    assert [entry.source for entry in read_journal(preview.journal_path).pending] == [
+        source
+    ]
+
+
 # ASSIGN-10: partial undo can be retried, moved files are verified.
 
 
