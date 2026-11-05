@@ -520,9 +520,12 @@ def test_ctrl_c_as_a_folder_is_journaled_leaves_no_unrecorded_folder(
     folders = {path.resolve() for path in target.iterdir()}
     assert folders - {(target / JOURNAL_DIR_NAME).resolve()} <= recorded
 
+    # `dite undo <target>` finds the run, although it moved no file.
+    assert find_latest_journal(target) == preview.journal_path
     undo_journal(preview.journal_path)
 
     assert [path.name for path in target.iterdir()] == [JOURNAL_DIR_NAME]
+    assert find_latest_journal(target) is None
     assert first.read_text(encoding="utf-8") == "a"
     assert second.read_text(encoding="utf-8") == "b"
 
@@ -676,6 +679,7 @@ from dite.flow.move import (
 
 mode, signal_name = sys.argv[1], sys.argv[2]
 src, out = Path(sys.argv[3]), Path(sys.argv[4])
+kill_at = int(sys.argv[5])
 
 
 def tree(path):
@@ -705,7 +709,7 @@ copies = []
 
 def copyfileobj(fsrc, fdst, *args, **kwargs):
     copies.append(fsrc.name)
-    if len(copies) == 2:  # the signal comes with the second file half copied
+    if len(copies) == kill_at:  # the signal comes with this file half copied
         fdst.write(fsrc.read(1000))
         fdst.flush()
         os.kill(os.getpid(), getattr(signal, signal_name))
@@ -735,16 +739,16 @@ def _assert_payloads_back(folder: Path) -> None:
         assert (folder / name).read_bytes() == data
 
 
-def _kill_mid_copy(tmp_path: Path, mode: str, signal_name: str):
+def _kill_mid_copy(tmp_path: Path, mode: str, signal_name: str, copy: int = 2):
     """Organize (or undo) src <-> out as if on two file systems, in a child
-    process that gets ``signal_name`` with the second file half copied."""
+    process that gets ``signal_name`` with the ``copy``-th file half copied."""
     child = tmp_path / "bin" / "killed_mid_copy.py"
     child.parent.mkdir()
     child.write_text(_KILLED_MID_COPY, encoding="utf-8")
     src_dir = Path(move_module.__file__).parents[2]
     return subprocess.run(
         [sys.executable, str(child), mode, signal_name]
-        + [str(tmp_path / "src"), str(tmp_path / "out")],
+        + [str(tmp_path / "src"), str(tmp_path / "out"), str(copy)],
         env=dict(os.environ, PYTHONPATH=str(src_dir)),
         capture_output=True,
         timeout=120,
@@ -774,6 +778,31 @@ def test_organize_killed_mid_copy_leaves_nothing_undo_cannot_clean_up(
     assert result.skipped == []
     _assert_payloads_back(tmp_path / "src")
     assert _organized_files(tmp_path / "out") == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs POSIX signals")
+@pytest.mark.parametrize("signal_name", ["SIGTERM", "SIGKILL"])
+def test_organize_killed_before_its_first_move_is_found_by_undo(
+    tmp_path: Path, signal_name: str
+) -> None:
+    _write_payloads(tmp_path / "src")
+
+    run = _kill_mid_copy(tmp_path, "execute", signal_name, copy=1)
+
+    assert run.returncode != 0, run.stderr
+    _assert_payloads_back(tmp_path / "src")
+    # The run's folder stays behind (with a half copy after kill -9), and
+    # its journal records the folder but no move.
+    assert (tmp_path / "out" / "Topic").is_dir()
+
+    journal = find_latest_journal(tmp_path / "out")
+
+    assert journal is not None
+    result = undo_journal(journal)
+    assert (result.restored, result.skipped) == ([], [])
+    assert os.listdir(tmp_path / "out") == [JOURNAL_DIR_NAME]
+    assert find_latest_journal(tmp_path / "out") is None
+    assert sorted(os.listdir(tmp_path / "src")) == sorted(_PAYLOADS)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="needs POSIX signals")
@@ -1406,6 +1435,47 @@ def test_cli_undo_stops_with_a_clear_message_when_the_journal_cannot_be_written(
     assert not (preview.target_folder / "Topic").exists()
     for index, path in enumerate(files):
         assert path.read_text(encoding="utf-8") == f"payload {index}"
+
+
+@pytest.mark.parametrize("where", ["record", "copy"])
+def test_cli_undo_removes_the_folders_of_a_run_stopped_before_its_first_move(
+    tmp_path: Path, monkeypatch, where: str
+) -> None:
+    _write_cli_config(tmp_path, monkeypatch)
+    first = _write(tmp_path / "src" / "a.txt", "a")
+    second = _write(tmp_path / "src" / "b.txt", "b")
+    target = tmp_path / "out"
+    preview = OrganizePreview(source_folder=tmp_path / "src", target_folder=target)
+    preview.add_cluster("One", [first])
+    preview.add_cluster("Two", [second])
+
+    def interrupt(*_args, **_kwargs):
+        signal.raise_signal(signal.SIGINT)  # Ctrl-C on the first file
+
+    with monkeypatch.context() as patch:
+        if where == "copy":
+            patch.setattr(os, "link", _no_link)
+            patch.setattr(shutil, "copyfileobj", interrupt)
+        else:
+            patch.setattr(move_module.MoveJournal, "record_move", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            _execute(preview)
+    assert sorted(path.name for path in target.iterdir()) == [
+        JOURNAL_DIR_NAME,
+        "One",
+        "Two",
+    ]
+    runner = CliRunner()
+
+    # No --yes and no answer: nothing is moved back, so nothing is asked.
+    result = runner.invoke(app, ["undo", str(target)])
+
+    assert result.exit_code == 0, result.output
+    assert [path.name for path in target.iterdir()] == [JOURNAL_DIR_NAME]
+    assert read_journal(preview.journal_path).undone is True
+    assert first.read_text(encoding="utf-8") == "a"
+    assert second.read_text(encoding="utf-8") == "b"
+    assert runner.invoke(app, ["undo", str(target)]).exit_code == 1  # all done
 
 
 def test_cli_undo_finishes_an_undo_stopped_after_its_last_file(
