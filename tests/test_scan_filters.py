@@ -1,5 +1,6 @@
 """Scan skip rules: hidden, dependency, package and system entries."""
 
+import errno
 import os
 from pathlib import Path
 
@@ -146,6 +147,49 @@ def test_scan_prunes_skipped_directories_without_listing_them(
     assert listed, "expected the scan to list at least the root folder"
     pruned = {"node_modules", ".git", "App.app"}
     assert not [path for path in listed if pruned & set(path.parts)]
+
+
+@pytest.mark.parametrize("error", [errno.EACCES, errno.EPERM], ids=["EACCES", "EPERM"])
+def test_scan_skips_subdirectory_it_may_not_enter(
+    tmp_path: Path,
+    monkeypatch,
+    error: int,
+) -> None:
+    root = tmp_path / "docs"
+    _touch(root / "keep.md")
+    _touch(root / "sub" / "a.txt")
+    locked = root / "locked"
+    _touch(locked / "x.md")
+
+    # A folder the user may not search or list, such as a root-owned
+    # lost+found on a mounted drive (EACCES) or a macOS privacy-protected
+    # folder (EPERM): the folder itself can be stat'ed, nothing inside it can,
+    # and listing it fails. Faked because tests may run as root.
+    def inside_locked(path) -> bool:
+        return isinstance(path, (str, os.PathLike)) and Path(path).is_relative_to(
+            locked
+        )
+
+    def refuse(path):
+        raise PermissionError(error, os.strerror(error), os.fspath(path))
+
+    real_stat = os.stat
+    real_scandir = os.scandir
+
+    def guarded_stat(path, *args, **kwargs):
+        if inside_locked(path) and Path(path) != locked:
+            refuse(path)
+        return real_stat(path, *args, **kwargs)
+
+    def guarded_scandir(path="."):
+        if inside_locked(path):
+            refuse(path)
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "stat", guarded_stat)
+    monkeypatch.setattr(os, "scandir", guarded_scandir)
+
+    assert _scan(root) == ["keep.md", "sub/a.txt"]
 
 
 def test_scan_keeps_exclude_paths_with_skip_rules(tmp_path: Path) -> None:

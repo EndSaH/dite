@@ -102,7 +102,11 @@ def _is_skipped_dir(parent: Path, name: str) -> bool:
         name.startswith(HIDDEN_NAME_PREFIX)
         or lowered in SKIPPED_DIR_NAMES
         or os.path.splitext(lowered)[1] in PACKAGE_DIR_SUFFIXES
-        or (parent / name / VIRTUALENV_MARKER).is_file()
+        # 用 os.path.isfile 而不是 Path.is_file：后者遇到无权进入的目录（例如
+        # 挂载盘上 root 的 lost+found、macOS 受隐私保护的目录）会抛出
+        # PermissionError，让整次扫描中止；前者吞掉 OSError 返回 False，
+        # 随后 os.walk 列不出这个目录，就把它跳过。
+        or os.path.isfile(parent / name / VIRTUALENV_MARKER)
     )
 
 
