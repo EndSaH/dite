@@ -1213,7 +1213,8 @@ def _is_leftover_duplicate(source: Path, destination: Path) -> bool:
     file about to be removed), and either the same inode reached through two
     hard links or byte-identical copies. Where the file system reports no
     inode numbers (0, as some Windows network drives do), only the content
-    can tell.
+    can tell, once the two paths are known not to lead to one file (a
+    folder replaced by a link or junction to the organized one).
     """
     try:
         src = os.lstat(source)
@@ -1225,9 +1226,22 @@ def _is_leftover_duplicate(source: Path, destination: Path) -> bool:
     if src.st_ino and (src.st_dev, src.st_ino) == (dst.st_dev, dst.st_ino):
         # Two names for one file; with a single link they are one name.
         return dst.st_nlink > 1
+    if not src.st_ino and _same_real_path(source, destination):
+        return False
     if src.st_size != dst.st_size:
         return False
     try:
         return filecmp.cmp(source, destination, shallow=False)
     except OSError:
         return False
+
+
+def _same_real_path(first: Path, second: Path) -> bool:
+    """Whether two paths name one file once links are resolved; ``True``
+    when that cannot be told, so that nothing is removed on a guess."""
+    try:
+        return os.path.normcase(os.path.realpath(first, strict=True)) == (
+            os.path.normcase(os.path.realpath(second, strict=True))
+        )
+    except (OSError, ValueError):
+        return True

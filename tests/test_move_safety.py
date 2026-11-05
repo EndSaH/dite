@@ -1157,6 +1157,25 @@ def test_undo_compares_content_where_inode_numbers_are_missing(
     assert files[0].read_text(encoding="utf-8") == "another file"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="needs directory symlinks")
+def test_undo_keeps_the_only_copy_when_the_source_path_leads_to_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    preview, files = _organize(tmp_path, ["a.txt"])
+    moved = preview.operations[0].destination
+    # The source folder is replaced by a link to the organized folder, so
+    # the original path now reaches the organized file itself.
+    (tmp_path / "src").rmdir()
+    (tmp_path / "src").symlink_to(moved.parent, target_is_directory=True)
+    _without_inode_numbers(monkeypatch)
+
+    result = undo_journal(preview.journal_path)
+    monkeypatch.undo()
+
+    assert result.skipped == [(files[0], "conflict")]
+    assert moved.read_text(encoding="utf-8") == "payload 0"
+
+
 def test_undo_skips_files_replaced_after_the_move(tmp_path: Path) -> None:
     preview, files = _organize(tmp_path, ["a.txt", "b.txt"])
     replaced, touched = (op.destination for op in preview.operations)
