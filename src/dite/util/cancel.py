@@ -35,9 +35,18 @@ def cancellation_scope(event: threading.Event) -> Iterator[None]:
         _scope.event = previous
 
 
+def current_cancel_event() -> threading.Event | None:
+    """Return the current thread's cancel event, or ``None`` outside a scope.
+
+    For handing the signal to work that runs on another thread, such as the
+    request runtime's event loop.
+    """
+    return getattr(_scope, "event", None)
+
+
 def cancellation_requested() -> bool:
     """Return whether the current thread's scope has been cancelled."""
-    event = getattr(_scope, "event", None)
+    event = current_cancel_event()
     return event is not None and event.is_set()
 
 

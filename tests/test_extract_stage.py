@@ -1,9 +1,11 @@
 """Per-file failure isolation and Ctrl+C handling in the extraction stage."""
 
+import asyncio
 import sqlite3
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
@@ -24,6 +26,7 @@ from dite.io.pdf.final import PDFCacheWriteIntent
 from dite.io.pdf.render import PDFRenderResult
 from dite.io.pdf.vlm import extract_pdf_with_vlm_sampling
 from dite.io.types import ResolvedExtraction
+from dite.util.api import AsyncRequestRuntime
 from dite.util.log import get_logger, setup_logging
 
 
@@ -458,6 +461,86 @@ def test_pdf_vlm_sampling_sends_no_requests_once_cancelled(
 
     assert runtime.calls == []
     assert client.calls == []
+
+
+# The queued pages wait either for a global VLM request slot or, with slots to
+# spare, for the per-document page limit.
+@pytest.mark.parametrize(
+    "vlm_api_workers", [2, 8], ids=["global_limit", "per_document_limit"]
+)
+def test_pdf_vlm_runtime_batch_sends_no_more_pages_once_cancelled(
+    tmp_path: Path, monkeypatch, vlm_api_workers: int
+) -> None:
+    from dite.util.cancel import ExtractionCancelledError, cancellation_scope
+
+    set_locale("en")
+    setup_logging()
+    file_path = tmp_path / "scan.pdf"
+    file_path.write_bytes(b"%PDF-1.7")
+    monkeypatch.setattr(
+        "dite.io.pdf.vlm.render_pdf_pages",
+        lambda path, *, max_pages: PDFRenderResult(
+            pages=[_Image() for _ in range(6)],
+            success=True,
+            error=None,
+            sample_page_limit=max_pages,
+        ),
+    )
+    sent: list[dict] = []
+    first_round_sent = threading.Event()
+    release = threading.Event()
+
+    class _Completions:
+        async def create(self, **kwargs):
+            sent.append(kwargs)
+            if len(sent) == 2:
+                first_round_sent.set()
+            while not release.is_set():
+                await asyncio.sleep(0.005)
+            message = SimpleNamespace(content="page text")
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    class _Client:
+        chat = SimpleNamespace(completions=_Completions())
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "dite.util.api._build_async_openai_client", lambda config: _Client()
+    )
+    config = Config()
+    config.api.api_key = "dummy"
+    config.api.base_url = "https://api.example.com/v1"
+    config.processing.vlm_api_workers = vlm_api_workers
+    config.processing.vlm_pages_per_document = 2
+    cancelled = threading.Event()
+    outcome: dict[str, str] = {}
+
+    def worker(runtime: AsyncRequestRuntime) -> None:
+        with cancellation_scope(cancelled):
+            try:
+                extract_pdf_with_vlm_sampling(
+                    file_path, None, config=config, request_runtime=runtime
+                )
+                outcome["result"] = "returned"
+            except ExtractionCancelledError:
+                outcome["result"] = "cancelled"
+
+    with AsyncRequestRuntime(config) as runtime:
+        thread = threading.Thread(target=worker, args=(runtime,))
+        thread.start()
+        assert first_round_sent.wait(5)
+        # Ctrl+C while the first two pages are in flight.
+        cancelled.set()
+        release.set()
+        thread.join(5)
+        assert not thread.is_alive()
+
+    # The four pages still queued are never sent, and the partial batch is
+    # not used as the file's content.
+    assert len(sent) == 2
+    assert outcome == {"result": "cancelled"}
 
 
 def _write_test_config(tmp_path: Path, monkeypatch, locale: str) -> None:

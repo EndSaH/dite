@@ -13,6 +13,11 @@ from openai import AsyncOpenAI, OpenAI
 
 from dite.app.config import Config
 from dite.app.i18n import t
+from dite.util.cancel import (
+    ExtractionCancelledError,
+    current_cancel_event,
+    raise_if_cancelled,
+)
 from dite.util.log import get_logger
 
 
@@ -85,6 +90,21 @@ def _build_async_openai_client(config: Config) -> AsyncOpenAI:
 def _effective_concurrency(requested: int, *, max_connections: int) -> int:
     requested = max(1, requested)
     return min(requested, max_connections)
+
+
+def _is_cancelled(cancel_event: threading.Event | None) -> bool:
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _cancelled_result(queued_at: float) -> ChatCompletionResult:
+    """Result for a request skipped because the run was interrupted."""
+    now = asyncio.get_running_loop().time()
+    return ChatCompletionResult(
+        content=None,
+        error=ExtractionCancelledError(),
+        queue_wait_sec=now - queued_at,
+        request_elapsed_sec=0.0,
+    )
 
 
 class AsyncRequestRuntime:
@@ -201,13 +221,20 @@ class AsyncRequestRuntime:
                 max(1, per_document_limit),
                 self._effective_vlm_pages_per_document,
             )
-        return self._submit_coroutine(
+        # Called on an extraction worker. Once the run is interrupted, pages
+        # still waiting for a request slot are not sent, and the partial
+        # batch is not handed back as if it were the document's content.
+        cancel_event = current_cancel_event()
+        results = self._submit_coroutine(
             self._run_batch(
                 requests=requests,
                 global_sem=self._vlm_global_sem,
                 local_limit=local_limit,
+                cancel_event=cancel_event,
             )
         ).result()
+        raise_if_cancelled()
+        return results
 
     def run_image_vlm(self, request: ChatCompletionRequest) -> ChatCompletionResult:
         return self.run_vlm_page_batch([request], per_document_limit=1)[0]
@@ -218,6 +245,7 @@ class AsyncRequestRuntime:
         requests: list[ChatCompletionRequest],
         global_sem: threading.BoundedSemaphore,
         local_limit: int | None,
+        cancel_event: threading.Event | None = None,
     ) -> list[ChatCompletionResult]:
         assert self._client is not None
         local_sem = asyncio.Semaphore(local_limit) if local_limit is not None else None
@@ -227,6 +255,7 @@ class AsyncRequestRuntime:
                 request=request,
                 global_sem=global_sem,
                 local_sem=local_sem,
+                cancel_event=cancel_event,
             )
             for request in requests
         ]
@@ -239,14 +268,21 @@ class AsyncRequestRuntime:
         request: ChatCompletionRequest,
         global_sem: threading.BoundedSemaphore,
         local_sem: asyncio.Semaphore | None,
+        cancel_event: threading.Event | None = None,
     ) -> ChatCompletionResult:
         queued_at = asyncio.get_running_loop().time()
         while not global_sem.acquire(blocking=False):
+            if _is_cancelled(cancel_event):
+                return _cancelled_result(queued_at)
             await asyncio.sleep(0.001)
         try:
             if local_sem is not None:
                 async with local_sem:
+                    if _is_cancelled(cancel_event):
+                        return _cancelled_result(queued_at)
                     return await self._perform_request(client, request, queued_at)
+            if _is_cancelled(cancel_event):
+                return _cancelled_result(queued_at)
             return await self._perform_request(client, request, queued_at)
         finally:
             global_sem.release()
