@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import re
+import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -211,7 +212,65 @@ def _fallback_name_from_file_name(file_name: str) -> str:
     cleaned = _normalize_cluster_name_text(stem)
     if _is_invalid_cluster_name(cleaned):
         return ""
-    return cleaned[:CLUSTER_NAME_OUTPUT_LIMIT]
+    return _truncate_cluster_name(cleaned)
+
+
+def _truncate_cluster_name(name: str) -> str:
+    """Cut ``name`` to ``CLUSTER_NAME_OUTPUT_LIMIT`` characters, between words.
+
+    In scripts that put spaces between words, a cut that would fall inside a
+    word moves back to the end of the word before it: "Machine Learning
+    Research Papers" becomes "Machine Learning", not "Machine Learning
+    Researc". Chinese and Japanese, written without spaces, are cut at the
+    limit, and so is a single word longer than the limit.
+    """
+    if len(name) <= CLUSTER_NAME_OUTPUT_LIMIT:
+        return name
+    cut = CLUSTER_NAME_OUTPUT_LIMIT
+    if _is_spaced_word_char(name[cut - 1]) and _is_spaced_word_char(name[cut]):
+        start = cut - 1
+        while start > 0 and _is_spaced_word_char(name[start - 1]):
+            start -= 1
+        if start > 0:
+            cut = start
+    # No dangling separator ("Finance &") at the end.
+    return name[:cut].rstrip(" ,;:&/|-–—") or name[:cut]
+
+
+def _is_spaced_word_char(char: str) -> bool:
+    """Whether ``char`` is part of a word that spaces separate (not CJK)."""
+    return (char.isalnum() or char in "'’") and unicodedata.east_asian_width(
+        char
+    ) not in ("W", "F")
+
+
+def _unique_cluster_names(cluster_names: dict[int, str]) -> dict[int, str]:
+    """Give every cluster a display name no other cluster has.
+
+    Each cluster is named on its own, so two can get the same name, or names
+    that differ only in case or Unicode normalization (NFC/NFD), which are
+    one folder name on macOS. In label order, the first keeps the name and
+    the others get ``_2``, ``_3``, ... A suffix never takes a name that
+    another cluster has.
+    """
+
+    def key(name: str) -> str:
+        return unicodedata.normalize("NFC", name).casefold()
+
+    taken = {key(name) for name in cluster_names.values()}
+    seen: set[str] = set()
+    unique: dict[int, str] = {}
+    for label in sorted(cluster_names):
+        name = cluster_names[label]
+        if key(name) in seen:
+            counter = 2
+            while key(f"{name}_{counter}") in taken:
+                counter += 1
+            name = f"{name}_{counter}"
+            taken.add(key(name))
+        seen.add(key(name))
+        unique[label] = name
+    return unique
 
 
 def _display_cluster_name(label: int, name: str) -> str:
@@ -219,7 +278,7 @@ def _display_cluster_name(label: int, name: str) -> str:
     cleaned = _normalize_cluster_name_text(name)
     if _is_invalid_cluster_name(cleaned):
         return f"{t('cluster_unnamed_label')}-{label}"
-    return cleaned[:CLUSTER_NAME_OUTPUT_LIMIT]
+    return _truncate_cluster_name(cleaned)
 
 
 def _cluster_debug_token(index: int) -> str:
@@ -269,7 +328,7 @@ def _heuristic_cluster_name(sample_contents: list[str], sample_names: list[str])
     for content in sample_contents:
         title = _extract_title_like_line(content)
         if title:
-            return title[:CLUSTER_NAME_OUTPUT_LIMIT]
+            return _truncate_cluster_name(title)
 
     for file_name in sample_names:
         fallback_name = _fallback_name_from_file_name(file_name)
@@ -405,7 +464,7 @@ def generate_cluster_name(
                     t("debug_cluster_name_invalid_fallback", fallback=fallback)
                 )
                 return _ClusterName(fallback, _FALLBACK_INVALID)
-            return name[:CLUSTER_NAME_OUTPUT_LIMIT]
+            return _truncate_cluster_name(name)
         except APIError as exc:
             last_error = format_api_error(exc)
             is_last_attempt = attempt == CLUSTER_NAME_MAX_RETRIES - 1
@@ -716,6 +775,7 @@ def generate_all_cluster_names(
         updated_labels, updated_names, merged_count = merge_clusters_by_name(
             labels, cluster_names
         )
+    updated_names = _unique_cluster_names(updated_names)
     updated_metrics = dataclasses.replace(
         result.metrics,
         name_clusters_merged=merged_count,

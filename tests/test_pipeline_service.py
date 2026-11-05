@@ -3881,11 +3881,11 @@ def test_generate_all_cluster_names_clamps_non_positive_worker_count_to_one() ->
     assert np.array_equal(named_result.labels, labels)
     assert named_result.cluster_names == {
         0: "Stable Topic",
-        1: "Stable Topic",
+        1: "Stable Topic_2",
     }
 
 
-def test_generate_all_cluster_names_keeps_duplicate_names_when_merge_disabled() -> None:
+def test_generate_all_cluster_names_suffixes_same_names_without_merge() -> None:
     from dite.cluster.api import generate_all_cluster_names
 
     class _Completions:
@@ -3933,9 +3933,10 @@ def test_generate_all_cluster_names_keeps_duplicate_names_when_merge_disabled() 
 
     assert named_result.name_clusters_merged == 0
     assert np.array_equal(named_result.labels, result.labels)
+    # The clusters stay apart, and each keeps a name of its own.
     assert named_result.cluster_names == {
         4: "Shared Topic",
-        7: "Shared Topic",
+        7: "Shared Topic_2",
     }
 
 
@@ -4403,7 +4404,7 @@ def test_generate_cluster_name_builds_zh_prompt_from_content_samples() -> None:
 
 
 def test_generate_cluster_name_truncates_long_valid_model_output() -> None:
-    from dite.cluster.api import CLUSTER_NAME_OUTPUT_LIMIT, generate_cluster_name
+    from dite.cluster.api import generate_cluster_name
 
     class _Completions:
         def create(self, **kwargs):
@@ -4436,10 +4437,8 @@ def test_generate_cluster_name_truncates_long_valid_model_output() -> None:
         llm_model="dummy-model",
     )
 
-    assert (
-        name
-        == "Advanced Linear Algebra Reference Materials"[:CLUSTER_NAME_OUTPUT_LIMIT]
-    )
+    # Cut to the limit (24 characters), between words.
+    assert name == "Advanced Linear Algebra"
 
 
 def test_cluster_naming_helper_normalization_and_invalid_detection() -> None:

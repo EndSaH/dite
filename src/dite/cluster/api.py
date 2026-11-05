@@ -23,6 +23,7 @@ from dite.cluster.name import (
     _build_cluster_debug_labels,
     _cluster_name_from_async_response,
     _prepare_cluster_name_request_inputs,
+    _unique_cluster_names,
     _warn_on_cluster_naming_fallbacks,
     merge_clusters_by_name,
 )
@@ -460,6 +461,7 @@ def generate_all_cluster_names(
         updated_labels, updated_names, merged_count = merge_clusters_by_name(
             labels, cluster_names
         )
+    updated_names = _unique_cluster_names(updated_names)
     updated_metrics = dataclasses.replace(
         result.metrics,
         name_clusters_merged=merged_count,
