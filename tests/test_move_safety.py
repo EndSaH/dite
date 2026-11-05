@@ -1295,6 +1295,21 @@ def test_cli_undo_reports_partial_undo_and_retries(tmp_path: Path, monkeypatch) 
     assert read_journal(preview.journal_path).undone is True
 
 
+def test_cli_undo_reports_each_skip_once(tmp_path: Path, monkeypatch) -> None:
+    _write_cli_config(tmp_path, monkeypatch)
+    preview, files = _organize(tmp_path, ["a.txt", "b.txt"])
+    files[1].write_text("placeholder", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app, ["undo", str(preview.target_folder), "--yes"], env={"COLUMNS": "500"}
+    )
+
+    assert result.exit_code == 0, result.output
+    assert files[0].read_text(encoding="utf-8") == "payload 0"
+    # Shown with the plan, not again after the undo.
+    assert result.output.count("a file already exists at the original") == 1
+
+
 def test_cli_undo_writes_nothing_when_nothing_can_be_moved_back(
     tmp_path: Path, monkeypatch
 ) -> None:

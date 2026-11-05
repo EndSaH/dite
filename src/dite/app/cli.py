@@ -1108,7 +1108,9 @@ def undo(
             )
         )
         raise typer.Exit(1) from exc
-    _print_undo_skips(logger, result.skipped, sources)
+    # Skips the plan has shown already are not repeated.
+    new_skips = [item for item in result.skipped if item not in plan.skipped]
+    _print_undo_skips(logger, new_skips, sources)
     logger.success(
         t("undo_done", restored=len(result.restored), skipped=len(result.skipped))
     )
