@@ -16,7 +16,7 @@ _ENABLE_THINKING_DOMAINS = ("siliconflow.cn", "siliconflow.com", "modelscope.cn"
 _DASHSCOPE_HOST_RE = re.compile(r"dashscope(?:-[a-z0-9]+)?\.aliyuncs\.com")
 
 _REASONING_BLOCK_RE = re.compile(
-    r"<(think|thinking)\s*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL
+    r"<think(?:ing)?\s*>.*?</think(?:ing)?\s*>", re.IGNORECASE | re.DOTALL
 )
 _REASONING_OPEN_RE = re.compile(r"<think(?:ing)?\s*>", re.IGNORECASE)
 _REASONING_CLOSE_RE = re.compile(r"</think(?:ing)?\s*>", re.IGNORECASE)
@@ -30,14 +30,23 @@ def strip_reasoning_text(content: str | None) -> str:
     into ``content``. A reply cut off by ``max_tokens`` ends inside an
     unclosed ``<think>``, and chat templates that open the block in the
     prompt leave only ``</think>``; reasoning is dropped in every case.
+
+    Reasoning always comes before the answer, so only tags that lead the
+    reply count: an answer that quotes ``<think>`` (a topic about prompt
+    formats, say) is kept as it is.
     """
-    text = _REASONING_BLOCK_RE.sub("", content or "")
-    closing_tags = list(_REASONING_CLOSE_RE.finditer(text))
-    if closing_tags:
-        text = text[closing_tags[-1].end() :]
-    opening_tag = _REASONING_OPEN_RE.search(text)
-    if opening_tag:
-        text = text[: opening_tag.start()]
+    text = (content or "").lstrip()
+    opened_in_reply = False
+    while block := _REASONING_BLOCK_RE.match(text):
+        text = text[block.end() :].lstrip()
+        opened_in_reply = True
+    if _REASONING_OPEN_RE.match(text):
+        # Cut off by max_tokens inside the reasoning: there is no answer yet.
+        return ""
+    if not opened_in_reply:
+        closing_tag = _REASONING_CLOSE_RE.search(text)
+        if closing_tag and not _REASONING_OPEN_RE.search(text, 0, closing_tag.start()):
+            text = text[closing_tag.end() :]
     return text.strip()
 
 
@@ -57,6 +66,10 @@ def _resolve_reasoning_param_style(
     """Pick how thinking controls are sent; ``auto`` only trusts known hosts."""
     if reasoning_param_style != "auto":
         return reasoning_param_style
+    # Earlier releases matched "siliconflow.cn" anywhere in base_url, so a
+    # proxy URL that names it keeps getting the field.
+    if "siliconflow.cn" in str(getattr(client, "base_url", "") or "").casefold():
+        return "enable_thinking"
     host = _client_host(client)
     if _DASHSCOPE_HOST_RE.fullmatch(host) or any(
         host == domain or host.endswith(f".{domain}")

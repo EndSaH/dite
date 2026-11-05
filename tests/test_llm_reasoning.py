@@ -152,7 +152,9 @@ NAMING_FILES = [
         ("<think>\n\n</think>\n\nFinancial Reports", "Financial Reports"),
         ("The files cover matrices.\n</think>\nLinear Algebra", "Linear Algebra"),
         ("<THINK>plan</THINK>  Budget", "Budget"),
-        ("<think>a</think>Budget<think>b", "Budget"),
+        # Only reasoning that leads the reply is dropped.
+        ("<think>a</think>Budget<think>b", "Budget<think>b"),
+        ("Notes on the <think> tag", "Notes on the <think> tag"),
         ("Linear Algebra", "Linear Algebra"),
         ("", ""),
         (None, ""),
@@ -184,6 +186,33 @@ def test_parse_json_object_does_not_read_truncated_reasoning_as_answer() -> None
     reply = '<think>\nA draft answer could be {"should_merge": true} but wait'
 
     assert parse_json_object(reply) is None
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        (
+            '{"topic": "Qwen3 <think> tag usage", "keywords": ["qwen3"]}',
+            {"topic": "Qwen3 <think> tag usage", "keywords": ["qwen3"]},
+        ),
+        (
+            '{"topic": "<think> and </think> markers"}',
+            {"topic": "<think> and </think> markers"},
+        ),
+        (
+            '<think>\nThe docs explain tags.\n</think>\n{"topic": "<think> tags"}',
+            {"topic": "<think> tags"},
+        ),
+        (
+            '<think>\nShort.\n</think>\n{"topic": "The </think> token"}',
+            {"topic": "The </think> token"},
+        ),
+    ],
+)
+def test_parse_json_object_keeps_think_tags_quoted_in_the_answer(
+    reply: str, expected: dict
+) -> None:
+    assert parse_json_object(reply) == expected
 
 
 def test_adjudication_and_representation_parsers_strip_reasoning() -> None:
@@ -376,6 +405,8 @@ def test_think_replies_are_cleaned_in_async_naming(module_name: str) -> None:
         "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         "https://api-inference.modelscope.cn/v1",
         "https://api.siliconflow.cn/v1",
+        # Earlier releases matched "siliconflow.cn" anywhere in base_url.
+        "https://proxy.example.com/siliconflow.cn/v1",
     ],
 )
 def test_reasoning_off_is_sent_to_known_enable_thinking_hosts(base_url: str) -> None:
