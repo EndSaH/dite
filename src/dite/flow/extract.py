@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import dataclasses
 import hashlib
 import itertools
@@ -103,6 +104,11 @@ class BestEffortCache:
         try:
             return operation(self._cache)
         except _CACHE_ERRORS as exc:
+            # A COMMIT that failed with "database is locked" leaves its
+            # transaction open, and the connection would keep the database
+            # locked for every other thread and process.
+            with contextlib.suppress(sqlite3.Error):
+                self._cache.rollback()
             self._cache = None
             self._logger.warning(
                 t(

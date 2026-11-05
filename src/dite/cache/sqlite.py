@@ -105,6 +105,16 @@ class FileCache:
         self._local.conn = conn
         return conn
 
+    def rollback(self) -> None:
+        """回滚当前线程连接上未结束的事务，释放它持有的锁。
+
+        COMMIT 因 database is locked 失败时 SQLite 不会结束事务，
+        这个连接会一直锁着数据库，挡住其他连接的读写。
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.rollback()
+
     def _init_db(self) -> None:
         """初始化数据库表"""
         conn = self._get_conn()

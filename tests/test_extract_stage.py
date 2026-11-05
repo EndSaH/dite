@@ -340,6 +340,74 @@ def test_pipeline_keeps_the_content_of_a_file_deleted_after_extraction(
     assert "FileNotFoundError" in output
 
 
+class _QuickBusyFileCache(FileCache):
+    """A real cache whose connections give up on a locked database after 50 ms."""
+
+    def _create_conn(self) -> sqlite3.Connection:
+        conn = super()._create_conn()
+        conn.execute("PRAGMA busy_timeout = 50")
+        return conn
+
+
+@_ENTRY_POINTS
+def test_pipeline_releases_the_cache_lock_after_a_failed_commit(
+    tmp_path: Path, monkeypatch, capsys, extract
+) -> None:
+    set_locale("en")
+    setup_logging()
+    files = _write_files(tmp_path, ["a.txt", "b.txt"])
+
+    def fake_extract_document(file_path, client, registry=None, config=None):
+        del client, registry, config
+        return ExtractionResult(
+            content=f"{file_path.stem} content long enough",
+            success=True,
+            extractor="text",
+        )
+
+    monkeypatch.setattr("dite.io.route.extract_document", fake_extract_document)
+    db_path = tmp_path / "cache" / "cache.db"
+    cache = _QuickBusyFileCache(db_path=db_path)
+    config = Config()
+    config.processing.extract_workers = 1
+    service = PipelineService(client=object(), config=config, cache=cache)
+    # Another process is reading the cache, so each new row's COMMIT cannot
+    # get the write lock and fails with "database is locked". SQLite leaves
+    # that transaction open, still holding its lock.
+    reader = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM file_cache").fetchall()
+        contents, reports, summary = extract(
+            service,
+            files,
+            PipelineOptions(use_cache=True, use_embedding_cache=False),
+        )
+        reader.execute("COMMIT")
+
+        # The reader is gone, so the cache must work again on every thread
+        # (the vectorize stage uses it next from the main thread).
+        assert cache.get_content(files[0], reports[0].file_hash) == (None, None)
+        cache.save(
+            file_path=files[1],
+            file_hash=reports[1].file_hash,
+            file_mtime=files[1].stat().st_mtime,
+            content_md="b content long enough",
+            enforce_size_limit=False,
+        )
+        cached_b, _source = cache.get_content(files[1], reports[1].file_hash)
+    finally:
+        reader.close()
+        cache.close()
+
+    assert contents == ["a content long enough", "b content long enough"]
+    assert summary.primary_failures == 0
+    assert cached_b == "b content long enough"
+    output = " ".join(capsys.readouterr().out.split())
+    assert output.count("Cache read/write failed for") == 2
+    assert output.count("OperationalError: database is locked") == 2
+
+
 def test_extract_stage_stops_starting_files_after_keyboard_interrupt(
     tmp_path: Path,
 ) -> None:
