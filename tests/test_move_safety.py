@@ -1360,12 +1360,19 @@ def test_cli_undo_names_the_original_location_of_a_changed_file(
 ) -> None:
     _write_cli_config(tmp_path, monkeypatch)
     preview, files = _organize(tmp_path, ["deep/dir/thesis.txt"])
-    preview.operations[0].destination.write_text("edited", encoding="utf-8")
+    moved = preview.operations[0].destination
+    moved.write_text("edited", encoding="utf-8")
 
     result = CliRunner().invoke(app, ["undo", str(preview.target_folder), "--yes"])
 
     assert result.exit_code == 0, result.output
-    assert str(files[0]) in "".join(result.output.split())
+    # The edited file stays where it is, and the message says where it came
+    # from (rich may wrap the line anywhere).
+    assert moved.read_text(encoding="utf-8") == "edited"
+    assert not files[0].exists()
+    output = "".join(result.output.split())
+    assert "changedorreplaced" in output
+    assert f"itcamefrom{''.join(str(files[0]).split())}" in output
 
 
 def test_cli_undo_stops_with_a_clear_message_when_the_journal_cannot_be_written(
