@@ -81,6 +81,8 @@ class FileCache:
         self._conn_lock = threading.Lock()
         self._connections: dict[int, sqlite3.Connection] = {}
         self._local = threading.local()
+        # 上一次 VACUUM 是否失败（失败后文件缩不回去，会一直超限）
+        self._vacuum_failed = False
         self._init_db()
 
     def _create_conn(self) -> sqlite3.Connection:
@@ -199,8 +201,13 @@ class FileCache:
         target_size = int(self.max_size_bytes * 0.9)
         used = self._used_bytes(conn)
 
-        # 只有实际数据超限才删行；文件只是被空闲页撑大时，VACUUM 即可
-        if used > self.max_size_bytes:
+        # 文件超限后把实际数据删到上限的 90% 以下，再 VACUUM，留出余量。
+        # 改写一行时 SQLite 先分配新记录、再释放旧的溢出页，文件会多出约一行空闲页；
+        # 若只删到上限以下，数据贴着上限时每次写入都会让文件超限并触发一次全库 VACUUM。
+        # VACUUM 失败过时文件缩不回去、会一直超限，这时只在实际数据超过上限时才删，
+        # 否则每次写入都要淘汰一行。
+        evict_above = self.max_size_bytes if self._vacuum_failed else target_size
+        if used > evict_above:
             while used > target_size:
                 ids = self._oldest_ids_covering(conn, used, used - target_size)
                 if not ids:
@@ -216,13 +223,32 @@ class FileCache:
                 deleted += batch
                 used = self._used_bytes(conn)
 
-        # 使用独立连接执行 VACUUM，避免事务上下文冲突；
-        # 它把 freelist 中的页还给文件系统，文件才会真正变小
         conn.commit()
-        with sqlite3.connect(str(self.db_path)) as vacuum_conn:
-            vacuum_conn.execute("VACUUM")
+        # VACUUM 失败过时，只有这次删了行才重试，避免每次写入都去重写整个数据库
+        if deleted > 0 or not self._vacuum_failed:
+            self._vacuum()
 
         return deleted
+
+    def _vacuum(self) -> None:
+        """执行 VACUUM，把 freelist 中的页还给文件系统，文件才会真正变小。
+
+        失败（例如磁盘剩余空间不够 VACUUM 复制数据库，或数据库被占用）时只警告：
+        之前的删除已经提交，SQLite 会复用空闲页，缓存仍然可用。
+        """
+        try:
+            # 使用独立连接执行 VACUUM，避免事务上下文冲突
+            with sqlite3.connect(str(self.db_path)) as vacuum_conn:
+                vacuum_conn.execute("VACUUM")
+        except sqlite3.OperationalError as exc:
+            self._vacuum_failed = True
+            # 延迟导入：导入 dite.app 会加载 dite.cache，放在模块顶层会循环导入
+            from dite.app.i18n import t
+            from dite.util.log import get_logger
+
+            get_logger().warning(t("cache_vacuum_failed", error=exc))
+            return
+        self._vacuum_failed = False
 
     def enforce_size_limit(self) -> int:
         """公开执行缓存大小治理。"""

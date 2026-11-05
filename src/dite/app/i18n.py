@@ -155,6 +155,7 @@ class Messages:
     # Cache commands
     cache_cleared: str
     cache_vlm_cleared: str
+    cache_vacuum_failed: str
     cache_status_title: str
     cache_db_path: str
     cache_total_entries: str
@@ -481,6 +482,11 @@ ZH_CN = Messages(
     cache_vlm_cleared=(
         "已清除 {count} 条 VLM 缓存，并使 {embeddings} 条基于它的 Embedding 失效"
         "（文档转换结果和其他 Embedding 已保留）"
+    ),
+    cache_vacuum_failed=(
+        "无法压缩缓存文件（{error}）。已淘汰条目的空间会被复用，但文件会保持在 "
+        "cache.max_size_gb 以上，直到之后某次压缩成功。可释放磁盘空间或运行 "
+        "`dite cache clear`。"
     ),
     cache_status_title="缓存状态",
     cache_db_path="数据库路径:",
@@ -897,6 +903,11 @@ EN = Messages(
     cache_vlm_cleared=(
         "Cleared {count} VLM cache entries and invalidated {embeddings} embeddings "
         "built on them (document conversion results and other embeddings preserved)"
+    ),
+    cache_vacuum_failed=(
+        "Could not compact the cache file ({error}). Space from evicted entries "
+        "will be reused, but the file stays above cache.max_size_gb until a later "
+        "compaction succeeds. Free some disk space or run `dite cache clear`."
     ),
     cache_status_title="Cache Status",
     cache_db_path="Database path:",
