@@ -524,9 +524,14 @@ def _copy_new(source: Path, destination: Path) -> None:
             os.fsync(fdst.fileno())
             if os.fstat(fdst.fileno()).st_size != os.fstat(fsrc.fileno()).st_size:
                 raise OSError(t("error_copy_failed"))
+            fdst.close()  # here, so that an error closing it is cleaned up too
             shutil.copystat(source, destination)
         except BaseException:
-            fdst.close()
+            # After a failed flush (a full disk) close() flushes again and
+            # fails again, but it still closes the file; closing it a second
+            # time, when the with block ends, does nothing.
+            with suppress(OSError):
+                fdst.close()
             with suppress(OSError):
                 os.unlink(destination)
             raise

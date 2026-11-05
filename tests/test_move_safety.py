@@ -9,6 +9,7 @@ folder name point at the same directory.
 from __future__ import annotations
 
 import errno
+import io
 import os
 import shutil
 import subprocess
@@ -19,6 +20,7 @@ import pytest
 from rich.console import Console
 from typer.testing import CliRunner
 
+import dite.flow.move as move_module
 from dite.app.cli import app
 from dite.flow.move import (
     JOURNAL_DIR_NAME,
@@ -448,6 +450,56 @@ def test_source_delete_error_after_the_file_is_gone_keeps_the_moved_file(
     assert [entry.source for entry in read_journal(preview.journal_path).pending] == [
         source
     ]
+
+
+class _NearlyFullFile(io.FileIO):
+    """A file on a disk with ``room`` bytes left; writing more raises ENOSPC."""
+
+    def __init__(self, path, mode: str, room: int) -> None:
+        super().__init__(path, mode)
+        self.room = room
+
+    def write(self, data) -> int:
+        if self.room <= 0:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        written = super().write(bytes(data)[: self.room])
+        self.room -= written
+        return written
+
+
+def test_copy_that_fills_the_disk_while_flushing_leaves_no_partial_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sources = [
+        _write(tmp_path / "src" / f"doc{index}.pdf", "x" * 4096) for index in range(3)
+    ]
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", sources)
+    attempts: list[str] = []
+    real_open = open
+
+    def no_link(*_args, **_kwargs):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    def open_on_full_disk(file, mode="r", *args, **kwargs):
+        if mode != "xb":
+            return real_open(file, mode, *args, **kwargs)
+        attempts.append(os.fspath(file))
+        # Buffered like a real file: the copy fits in the buffer, so the
+        # error comes from flush() and again from close().
+        return io.BufferedWriter(_NearlyFullFile(file, "xb", room=1000))
+
+    monkeypatch.setattr(os, "link", no_link)
+    monkeypatch.setattr(move_module, "open", open_on_full_disk, raising=False)
+
+    assert _execute(preview) == (0, 3)
+    monkeypatch.undo()
+
+    assert _organized_files(preview.target_folder) == []
+    assert all(source.stat().st_size == 4096 for source in sources)
+    assert len(attempts) == 1
 
 
 # ASSIGN-10: partial undo can be retried, moved files are verified.
