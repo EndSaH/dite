@@ -3,17 +3,22 @@
 import multiprocessing
 import signal
 import threading
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from multiprocessing.connection import Connection
 from pathlib import Path
 
 from dite.app.i18n import set_locale, t
+from dite.util.cancel import raise_if_cancelled
 from dite.util.log import silence_docling_logging
 
 from .base import BaseExtractor, ExtractionResult
 
 _DOCLING_PDF_SETUP_COMMAND = "uv run dite setup docling-pdf"
+# How often the parent, while waiting on a Docling child, checks whether the
+# run has been cancelled.
+_DOCLING_PDF_CANCEL_CHECK_SEC = 0.2
 # How long a child that has already sent its result gets to exit by itself.
 _DOCLING_PDF_CHILD_EXIT_GRACE_SEC = 5.0
 
@@ -132,6 +137,15 @@ def _docling_pdf_extract_child(
         conn.close()
 
 
+def _run_docling_pdf_child(target: Callable[..., None], *args: object) -> None:
+    """Child entry point: leave Ctrl+C to the parent, then run ``target``."""
+    # Ctrl+C sends SIGINT to the whole process group. The parent decides what
+    # an interrupt means and terminates this process itself; ignoring the
+    # signal here avoids racing that decision and a second traceback.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    target(*args)
+
+
 def _stop_process(process: multiprocessing.process.BaseProcess) -> None:
     """Terminate a running child and reap it so it does not linger."""
     process.terminate()
@@ -160,11 +174,13 @@ def extract_docling_pdf_in_subprocess(
     device: str = "auto",
     max_pages: int | None = None,
 ) -> ExtractionResult:
+    raise_if_cancelled()
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe(duplex=False)
     process = ctx.Process(
-        target=_docling_pdf_extract_child,
+        target=_run_docling_pdf_child,
         args=(
+            _docling_pdf_extract_child,
             str(file_path),
             enable_ocr,
             str(artifacts_path) if artifacts_path is not None else None,
@@ -174,6 +190,7 @@ def extract_docling_pdf_in_subprocess(
             max_pages,
         ),
     )
+    deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
 
     started = False
     try:
@@ -184,16 +201,24 @@ def extract_docling_pdf_in_subprocess(
         # than the pipe buffer (64 KiB on Linux) keeps the child blocked in
         # send() until it is read, so waiting for the child to exit first
         # would only end at the timeout.
-        if not parent_conn.poll(timeout_sec):
-            return ExtractionResult(
-                content="",
-                success=False,
-                extractor=DoclingExtractor.name,
-                error=t(
-                    "error_docling_pdf_timeout",
-                    seconds=timeout_sec or 0,
-                ),
-            )
+        while True:
+            raise_if_cancelled()
+            wait_sec = _DOCLING_PDF_CANCEL_CHECK_SEC
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return ExtractionResult(
+                        content="",
+                        success=False,
+                        extractor=DoclingExtractor.name,
+                        error=t(
+                            "error_docling_pdf_timeout",
+                            seconds=timeout_sec or 0,
+                        ),
+                    )
+                wait_sec = min(wait_sec, remaining)
+            if parent_conn.poll(wait_sec):
+                break
 
         try:
             result = parent_conn.recv()
@@ -215,8 +240,8 @@ def extract_docling_pdf_in_subprocess(
         process.join(_DOCLING_PDF_CHILD_EXIT_GRACE_SEC)
         return result
     finally:
-        # Timeout, or an interrupt while waiting: do not leave the child
-        # running or unreaped.
+        # Timeout, cancellation, or an interrupt while waiting: do not leave
+        # the child running or unreaped.
         if started and process.is_alive():
             _stop_process(process)
         parent_conn.close()

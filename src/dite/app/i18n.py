@@ -173,6 +173,7 @@ class Messages:
     error_api_connection_failed: str
     error_api_request_failed: str
     error_processing_failed: str
+    error_interrupted: str
     error_docling_pdf_models_missing: str
     error_docling_pdf_timeout: str
     error_docling_pdf_subprocess_failed: str
@@ -508,6 +509,7 @@ ZH_CN = Messages(
     ),
     error_api_request_failed="API 请求失败: {error}",
     error_processing_failed="处理失败: {error}",
+    error_interrupted="已中断，本次运行已停止。",
     error_docling_pdf_models_missing="Docling PDF 模型未安装。请先运行 `{command}`。",
     error_docling_pdf_timeout="Docling PDF 提取超时: {seconds:g}s",
     error_docling_pdf_subprocess_failed=(
@@ -934,6 +936,7 @@ EN = Messages(
     ),
     error_api_request_failed="API request failed: {error}",
     error_processing_failed="Processing failed: {error}",
+    error_interrupted="Interrupted; the run was stopped.",
     error_docling_pdf_models_missing=(
         "Docling PDF models are not installed. Run `{command}` first."
     ),

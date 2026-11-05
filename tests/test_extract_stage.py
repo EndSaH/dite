@@ -1,9 +1,13 @@
-"""Per-file failure isolation in the extraction stage."""
+"""Per-file failure isolation and Ctrl+C handling in the extraction stage."""
 
+import threading
+import time
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
+from dite.app.cli import app
 from dite.app.config import Config
 from dite.app.i18n import set_locale
 from dite.flow.api import PipelineOptions, PipelineService
@@ -14,6 +18,8 @@ from dite.flow.model import (
     ExtractionWorkResult,
 )
 from dite.io.base import ExtractionResult
+from dite.io.pdf.render import PDFRenderResult
+from dite.io.pdf.vlm import extract_pdf_with_vlm_sampling
 from dite.util.log import get_logger, setup_logging
 
 
@@ -192,3 +198,182 @@ def test_pipeline_records_unreadable_files_as_failed_without_extracting_them(
     assert reports[1].file_hash != reports[2].file_hash
     assert summary.duplicate_count == 0
     assert summary.primary_failures == 2
+
+
+def test_extract_stage_stops_starting_files_after_keyboard_interrupt(
+    tmp_path: Path,
+) -> None:
+    files = _write_files(tmp_path, [f"{index:02d}.txt" for index in range(20)])
+    processed: list[str] = []
+    lock = threading.Lock()
+
+    def runner(item, options, truncate_limit, semaphore):
+        del options, truncate_limit, semaphore
+        with lock:
+            processed.append(item.file.name)
+        if item.file.name == "03.txt":
+            raise KeyboardInterrupt
+        time.sleep(0.05)
+        return _ok_result(item)
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_stage(files, runner, workers=2)
+
+    # At most the two files already running when 03.txt was interrupted, plus
+    # the one that replaced a finished file; never the rest of the folder.
+    assert len(processed) <= 5, processed
+    assert "19.txt" not in processed
+
+
+def test_extract_stage_tells_running_files_to_stop_after_keyboard_interrupt(
+    tmp_path: Path,
+) -> None:
+    from dite.util.cancel import cancellation_requested
+
+    files = _write_files(tmp_path, ["slow.txt", "boom.txt"])
+    slow_started = threading.Event()
+    outcome: dict[str, bool] = {}
+
+    def runner(item, options, truncate_limit, semaphore):
+        del options, truncate_limit, semaphore
+        if item.file.name == "boom.txt":
+            slow_started.wait(5)
+            raise KeyboardInterrupt
+        slow_started.set()
+        deadline = time.monotonic() + 5
+        while not cancellation_requested() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        outcome["saw_cancellation"] = cancellation_requested()
+        return _ok_result(item)
+
+    started = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        _run_stage(files, runner, workers=2)
+
+    assert outcome == {"saw_cancellation": True}
+    assert time.monotonic() - started < 3
+
+
+class _Image:
+    width = 800
+    height = 600
+
+    def save(self, buffer, _fmt):
+        buffer.write(b"png")
+
+
+class _RecordingRuntime:
+    def __init__(self) -> None:
+        self.calls: list[object] = []
+
+    def run_vlm_page_batch(self, requests, *, per_document_limit):
+        self.calls.append((requests, per_document_limit))
+        return []
+
+
+class _RecordingClient:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        client = self
+
+        class _Completions:
+            def create(self, **kwargs):
+                client.calls.append(kwargs)
+                raise AssertionError("no VLM request after cancellation")
+
+        class _Chat:
+            completions = _Completions()
+
+        self.chat = _Chat()
+
+
+@pytest.mark.parametrize("use_runtime", [True, False], ids=["runtime", "sync"])
+def test_pdf_vlm_sampling_sends_no_requests_once_cancelled(
+    tmp_path: Path, monkeypatch, use_runtime: bool
+) -> None:
+    from dite.util.cancel import ExtractionCancelledError, cancellation_scope
+
+    set_locale("en")
+    setup_logging()
+    file_path = tmp_path / "scan.pdf"
+    file_path.write_bytes(b"%PDF-1.7")
+    monkeypatch.setattr(
+        "dite.io.pdf.vlm.render_pdf_pages",
+        lambda path, *, max_pages: PDFRenderResult(
+            pages=[_Image(), _Image()],
+            success=True,
+            error=None,
+            sample_page_limit=max_pages,
+        ),
+    )
+    runtime = _RecordingRuntime()
+    client = _RecordingClient()
+    cancelled = threading.Event()
+    cancelled.set()
+
+    with cancellation_scope(cancelled), pytest.raises(ExtractionCancelledError):
+        extract_pdf_with_vlm_sampling(
+            file_path,
+            client,
+            config=Config(),
+            request_runtime=runtime if use_runtime else None,
+        )
+
+    assert runtime.calls == []
+    assert client.calls == []
+
+
+def _write_test_config(tmp_path: Path, monkeypatch, locale: str) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config_path = tmp_path / ".config" / "dite" / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "api:",
+                "  base_url: https://api.example.com/v1",
+                "  api_key: dummy-key",
+                "cache:",
+                f"  directory: {tmp_path / 'cache'}",
+                "i18n:",
+                f"  locale: {locale}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+class _InterruptedPipelineService:
+    def __init__(self, client, config=None, cache=None) -> None:
+        del client, config, cache
+
+    def run(self, folder, options):
+        del folder, options
+        raise KeyboardInterrupt
+
+    def extract_files(self, files, options):
+        del files, options
+        raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize(
+    ("locale", "message"),
+    [
+        ("en", "Interrupted; the run was stopped."),
+        ("zh-CN", "已中断，本次运行已停止。"),
+    ],
+)
+@pytest.mark.parametrize("command", ["scan", "pdf-check"])
+def test_cli_exits_130_with_a_message_on_ctrl_c(
+    tmp_path: Path, monkeypatch, command: str, locale: str, message: str
+) -> None:
+    _write_test_config(tmp_path, monkeypatch, locale)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "doc.pdf").write_bytes(b"%PDF-1.7")
+    monkeypatch.setattr("dite.app.cli.PipelineService", _InterruptedPipelineService)
+
+    result = CliRunner().invoke(app, [command, str(docs)])
+
+    assert result.exit_code == 130, result.output
+    assert message in result.output

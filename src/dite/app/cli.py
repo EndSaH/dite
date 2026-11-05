@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, NoReturn
 
 import click
 import numpy as np
@@ -256,11 +256,22 @@ def _run_pipeline_or_exit(
     return _call_pipeline_or_exit(lambda: pipeline.run(folder, options), cache)
 
 
+def _exit_interrupted(cache: FileCache | None) -> NoReturn:
+    """Report a Ctrl+C during a pipeline call and exit with code 130."""
+    get_logger().error(t("error_interrupted"))
+    if cache:
+        cache.close()
+    # 128 + SIGINT, the conventional status of a run stopped by Ctrl+C.
+    raise typer.Exit(130)
+
+
 def _call_pipeline_or_exit(call, cache: FileCache | None):
-    """Run a pipeline call; report runtime/API failures and exit with code 1."""
+    """Run a pipeline call; exit with code 1 on failures, 130 on Ctrl+C."""
     logger = get_logger()
     try:
         return call()
+    except KeyboardInterrupt:
+        _exit_interrupted(cache)
     except (APIConnectionError, APITimeoutError):
         logger.error(t("error_api_connection_failed"))
     except APIError as exc:
@@ -607,6 +618,8 @@ def pdf_check(
                 exclude_paths=[],
             ),
         )
+    except KeyboardInterrupt:
+        _exit_interrupted(cache)
     except (APIConnectionError, APITimeoutError):
         logger.error(t("error_api_connection_failed"))
         if cache:

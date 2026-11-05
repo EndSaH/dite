@@ -10,6 +10,7 @@ from openai import OpenAI
 from dite.app.config import Config
 from dite.app.i18n import get_locale, t
 from dite.util.api import AsyncRequestRuntime, ChatCompletionRequest
+from dite.util.cancel import raise_if_cancelled
 from dite.util.log import get_logger
 
 from ..base import ExtractionResult
@@ -132,6 +133,7 @@ def extract_pdf_with_vlm_sampling(
 ) -> VLMSamplingResult:
     """Use VLM to sample PDF pages for fallback extraction."""
     logger = get_logger()
+    raise_if_cancelled()
     try:
         rendered = render_pdf_pages(file_path, max_pages=max_pages)
         if not rendered.success:
@@ -186,6 +188,9 @@ def extract_pdf_with_vlm_sampling(
         api_page_calls = len(requests)
         all_contents: list[str] = []
 
+        # The run may have been interrupted while the pages were rendering;
+        # cancellation is a BaseException and passes the handlers below.
+        raise_if_cancelled()
         if request_runtime is not None:
             results = request_runtime.run_vlm_page_batch(
                 requests,
@@ -245,6 +250,7 @@ def extract_pdf_with_vlm_sampling(
                 )
         else:
             for page_num, request in zip(page_numbers, requests, strict=False):
+                raise_if_cancelled()
                 try:
                     logger.debug(t("debug_vlm_api_call"))
                     response = client.chat.completions.create(**request.kwargs)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import hashlib
+import itertools
 import os
 import threading
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from rich.markup import escape
 from dite.app.i18n import t
 from dite.cache import VLM_CACHE_VERSION
 from dite.io import get_extractor
+from dite.util.cancel import cancellation_scope, raise_if_cancelled
 from dite.util.hash import compute_file_hash
 
 from .model import (
@@ -325,13 +327,17 @@ def extract_stage(
         for i in canonical_indices
     ]
 
+    cancel_event = threading.Event()
+
     def run_item(item: ExtractionWorkItem) -> ExtractionWorkResult:
-        if item.index in hash_errors:
-            return _failed_work_result(item, hash_errors[item.index], logger)
-        try:
-            return extract_item(item)
-        except Exception as exc:
-            return _failed_work_result(item, exc, logger)
+        with cancellation_scope(cancel_event):
+            raise_if_cancelled()
+            if item.index in hash_errors:
+                return _failed_work_result(item, hash_errors[item.index], logger)
+            try:
+                return extract_item(item)
+            except Exception as exc:
+                return _failed_work_result(item, exc, logger)
 
     def extract_item(item: ExtractionWorkItem) -> ExtractionWorkResult:
         if work_item_runner is not None:
@@ -359,17 +365,37 @@ def extract_stage(
             resolve_document_extraction=resolve_document_extraction,
         )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=extract_workers) as executor:
-        future_to_index = {
-            executor.submit(run_item, item): item.index for item in work_items
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=extract_workers)
+    pending_items = iter(work_items)
+    try:
+        # Keep only as many files in flight as there are workers, so an
+        # interrupt has no queue of files left to drain.
+        in_flight = {
+            executor.submit(run_item, item)
+            for item in itertools.islice(pending_items, extract_workers)
         }
-        for future in concurrent.futures.as_completed(future_to_index):
-            result = future.result()
-            contents[result.index] = result.content
-            file_hashes[result.index] = result.file_hash
-            file_reports[result.index] = result.report
-            work_results[result.index] = result
-            merge_summary_delta(summary, result.summary_delta)
+        while in_flight:
+            done, in_flight = concurrent.futures.wait(
+                in_flight, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for future in done:
+                result = future.result()
+                contents[result.index] = result.content
+                file_hashes[result.index] = result.file_hash
+                file_reports[result.index] = result.report
+                work_results[result.index] = result
+                merge_summary_delta(summary, result.summary_delta)
+            for item in itertools.islice(pending_items, len(done)):
+                in_flight.add(executor.submit(run_item, item))
+    except BaseException:
+        # Ctrl+C (or a bug in this loop): tell the running files to stop at
+        # their next check, which terminates Docling subprocesses and skips
+        # VLM requests, and wait for them so that callers can close the
+        # request runtime and the cache safely.
+        cancel_event.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    executor.shutdown(wait=True)
 
     for indices in hash_to_indices.values():
         canonical_index = indices[0]

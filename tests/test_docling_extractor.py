@@ -1,8 +1,11 @@
 import multiprocessing
+import signal
+import threading
 import time
 from pathlib import Path
 
 import docling_child_helpers
+import pytest
 
 from dite.app.i18n import set_locale
 from dite.io.base import ExtractionResult
@@ -565,3 +568,62 @@ def test_extract_docling_pdf_in_subprocess_terminates_a_child_that_overruns(
     assert result.error == "Docling PDF extraction timed out after 1s"
     assert elapsed < 10
     assert set(multiprocessing.active_children()) <= children_before
+
+
+def test_extract_docling_pdf_in_subprocess_stops_the_child_when_cancelled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from dite.util.cancel import ExtractionCancelledError, cancellation_scope
+
+    set_locale("en")
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.7")
+    monkeypatch.setattr(
+        "dite.io.docling._docling_pdf_extract_child",
+        docling_child_helpers.sleep_forever,
+    )
+    children_before = set(multiprocessing.active_children())
+    cancelled = threading.Event()
+    timer = threading.Timer(0.5, cancelled.set)
+    started = time.monotonic()
+    timer.start()
+    try:
+        with cancellation_scope(cancelled), pytest.raises(ExtractionCancelledError):
+            extract_docling_pdf_in_subprocess(pdf_path, timeout_sec=30, locale="en")
+    finally:
+        timer.cancel()
+
+    assert time.monotonic() - started < 10
+    assert set(multiprocessing.active_children()) <= children_before
+
+
+def test_extract_docling_pdf_in_subprocess_starts_no_child_once_cancelled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from dite.util.cancel import ExtractionCancelledError, cancellation_scope
+
+    def _no_context(method):
+        raise AssertionError(f"no {method} subprocess after cancellation")
+
+    monkeypatch.setattr("dite.io.docling.multiprocessing.get_context", _no_context)
+    cancelled = threading.Event()
+    cancelled.set()
+
+    with cancellation_scope(cancelled), pytest.raises(ExtractionCancelledError):
+        extract_docling_pdf_in_subprocess(
+            tmp_path / "paper.pdf", timeout_sec=30, locale="en"
+        )
+
+
+def test_docling_pdf_child_leaves_ctrl_c_to_the_parent(monkeypatch) -> None:
+    from dite.io.docling import _run_docling_pdf_child
+
+    events: list[object] = []
+    monkeypatch.setattr(
+        "dite.io.docling.signal.signal",
+        lambda signum, handler: events.append((signum, handler)),
+    )
+
+    _run_docling_pdf_child(lambda *args: events.append(args), "a.pdf", False)
+
+    assert events == [(signal.SIGINT, signal.SIG_IGN), ("a.pdf", False)]
