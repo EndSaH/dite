@@ -3,6 +3,7 @@ import signal
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import docling_child_helpers
 import pytest
@@ -605,7 +606,10 @@ def test_extract_docling_pdf_in_subprocess_starts_no_child_once_cancelled(
     def _no_context(method):
         raise AssertionError(f"no {method} subprocess after cancellation")
 
-    monkeypatch.setattr("dite.io.docling.multiprocessing.get_context", _no_context)
+    # Replace the module docling.py sees, not the stdlib's own get_context.
+    monkeypatch.setattr(
+        "dite.io.docling.multiprocessing", SimpleNamespace(get_context=_no_context)
+    )
     cancelled = threading.Event()
     cancelled.set()
 

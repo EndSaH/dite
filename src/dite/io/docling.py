@@ -141,7 +141,9 @@ def _run_docling_pdf_child(target: Callable[..., None], *args: object) -> None:
     """Child entry point: leave Ctrl+C to the parent, then run ``target``."""
     # Ctrl+C sends SIGINT to the whole process group. The parent decides what
     # an interrupt means and terminates this process itself; ignoring the
-    # signal here avoids racing that decision and a second traceback.
+    # signal here avoids racing that decision and a second traceback. It only
+    # takes effect once the child runs this function: a Ctrl+C while the
+    # spawned interpreter is still importing dite can still print one.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     target(*args)
 
