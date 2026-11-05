@@ -12,8 +12,12 @@ def apply_clustering_to_preview(
     labels,
     cluster_names,
 ) -> None:
-    """Populate an organize preview from pipeline clustering output."""
-    for label in set(labels):
+    """Populate an organize preview from pipeline clustering output.
+
+    Labels are visited in order, so when two clusters end up with the same
+    folder name the lower label keeps it and the other gets the ``_2`` suffix.
+    """
+    for label in sorted(set(labels)):
         if label == -1:
             noise_files = [
                 file

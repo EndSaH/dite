@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shlex
 import shutil
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +49,16 @@ def shell_quote(value: str | Path) -> str:
     return "$'" + "".join(escaped) + "'"
 
 
+def _name_key(name: str) -> str:
+    """Comparison key for names, matching case-insensitive volumes.
+
+    APFS and HFS+ (the macOS default) ignore case and treat the NFC and NFD
+    spellings of a name as the same entry, so two names that are equal under
+    this key are one file or folder there.
+    """
+    return unicodedata.normalize("NFC", name).casefold()
+
+
 @dataclass
 class FileOperation:
     """文件操作"""
@@ -71,6 +82,8 @@ class OrganizePreview:
     )  # 簇名称 -> 文件列表
     noise_files: list[Path] = field(default_factory=list)  # 未分类的文件
     journal_path: Path | None = None  # 最近一次 execute 写入的移动记录
+    # _name_key() of every folder name in cluster_map.
+    _folder_keys: set[str] = field(default_factory=set, init=False, repr=False)
 
     @staticmethod
     def _sanitize_cluster_name(cluster_name: str) -> str:
@@ -106,8 +119,21 @@ class OrganizePreview:
         return candidate
 
     def add_cluster(self, cluster_name: str, files: list[Path]) -> None:
-        """添加一个簇的文件"""
-        self._add_folder_operations(self._sanitize_cluster_name(cluster_name), files)
+        """添加一个簇的文件
+
+        Every call is a separate cluster and gets a folder of its own. When an
+        earlier cluster already uses the (sanitized) name, compared the way
+        case-insensitive volumes compare names, this one becomes ``Name_2``,
+        ``Name_3``, ...: clusters are never merged just because their names
+        are equal.
+        """
+        name = self._sanitize_cluster_name(cluster_name)
+        folder_name = name
+        counter = 2
+        while _name_key(folder_name) in self._folder_keys:
+            folder_name = f"{name}_{counter}"
+            counter += 1
+        self._add_folder_operations(folder_name, files)
 
     def add_existing_folder(self, folder_name: str, files: list[Path]) -> None:
         """Move files into an existing subfolder of the target, keeping its name.
@@ -121,6 +147,7 @@ class OrganizePreview:
 
     def _add_folder_operations(self, folder_name: str, files: list[Path]) -> None:
         safe_cluster_name = folder_name
+        self._folder_keys.add(_name_key(safe_cluster_name))
         self.cluster_map.setdefault(safe_cluster_name, [])
         self.cluster_map[safe_cluster_name].extend(files)
 
