@@ -22,7 +22,7 @@
 
 - 名字以 `.` 开头的目录和文件，例如 `.git`、`.venv`、`.obsidian`、`.DS_Store`、macOS 的 AppleDouble 元数据文件 `._*`。
 - 依赖和系统目录：`node_modules`、`__pycache__`、`site-packages`、`__MACOSX`、`$RECYCLE.BIN`、`System Volume Information`，以及包含 `pyvenv.cfg` 的 Python 虚拟环境（目录名不必带点，例如 `venv`、`env`）。
-- Finder 当成单个文件显示的 macOS 包目录，例如 `.app`、`.bundle`、`.framework`、`.plugin`、`.kext`、`.pkg`、`.photoslibrary`、`.musiclibrary`、`.tvlibrary`、`.imovielibrary`、`.fcpbundle`、`.logicx`、`.xcodeproj`、`.xcworkspace`、`.sparsebundle`、`.rtfd`、`.pages`。完整列表见 `src/dite/flow/scan.py` 中的 `PACKAGE_DIR_SUFFIXES`。
+- Finder 当成单个文件显示的 macOS 包目录，例如 `.app`、`.bundle`、`.framework`、`.plugin`、`.kext`、`.pkg`、`.photoslibrary`、`.musiclibrary`、`.tvlibrary`、`.imovielibrary`、`.fcpbundle`、`.logicx`、`.xcodeproj`、`.xcworkspace`、`.sparsebundle`、`.rtfd`、`.pages`。完整列表见 `src/dite/flow/scan.py` 中的 `PACKAGE_DIR_SUFFIXES`。包目录只按名字后缀识别，所以名字恰好以这些后缀结尾的普通文件夹（例如 `Client.key`、`Lecture.pages`）也会被跳过；需要扫描它时，把它改名，或直接把它作为参数传入。
 - 临时和系统文件：Office 锁文件 `~$*`、`Thumbs.db`、`desktop.ini`。
 
 这些规则只检查命令参数所指目录之下的条目：直接把一个隐藏目录（或包目录、虚拟环境）作为参数传入时，它的内容照常扫描。名称比较不区分大小写。规则目前不可配置；`--verbose` 会打印跳过的目录和文件数量。
