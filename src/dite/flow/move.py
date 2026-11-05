@@ -426,21 +426,23 @@ def _move_file(op: FileOperation, journal: MoveJournal | None, taken: set[str]) 
     deleted, so an error or Ctrl-C leaves at worst a second name for a file
     the journal knows about, never a moved file that undo cannot find. The
     new name is removed again only while the source is known to be there:
-    when the journal write fails, or when deleting the source fails and the
-    source still exists. A process killed (or a machine losing power) between
-    creating the new name and the journal write can still leave that name
-    behind unrecorded, next to the untouched source.
+    when creating or journaling it is interrupted or fails, or when deleting
+    the source fails and the source still exists. A process killed (or a
+    machine losing power) between creating the new name and the journal
+    write can still leave that name behind unrecorded, next to the untouched
+    source; for a copy, so can a Ctrl-C that lands just as the new file is
+    opened or just as a finished copy returns.
     """
-    op.destination = _create_unique(op.source, op.destination, taken)
+    new_name = _NewName()
     move_id: int | None = None
-    if journal is not None:
-        try:
+    try:
+        op.destination = _create_unique(op.source, op.destination, taken, new_name)
+        if journal is not None:
             move_id = journal.record_move(op.source, op.destination)
-        except BaseException:
-            # The source is untouched, so the new name is only a duplicate.
-            with suppress(OSError):
-                os.unlink(op.destination)
-            raise
+    except BaseException:
+        # The source is untouched, so a name made for it is only a duplicate.
+        new_name.discard(op.source)
+        raise
     try:
         os.unlink(op.source)
     except OSError:
@@ -473,16 +475,49 @@ def _lexists_or_none(path: Path) -> bool | None:
     return True
 
 
-def _create_unique(source: Path, destination: Path, taken: set[str]) -> Path:
+@dataclass
+class _NewName:
+    """The name ``_create_unique`` is making, so an interrupt can undo it."""
+
+    path: Path | None = None
+    created: bool = False
+
+    def discard(self, source: Path) -> None:
+        """Remove the name if it was made for ``source``.
+
+        A Ctrl-C raised as ``os.link`` returns leaves ``created`` unset, but
+        the name is then a hard link to ``source`` itself.
+        """
+        if self.path is None:
+            return
+        if self.created or _same_inode(source, self.path):
+            with suppress(OSError):
+                os.unlink(self.path)
+
+
+def _same_inode(first: Path, second: Path) -> bool:
+    try:
+        a, b = os.lstat(first), os.lstat(second)
+    except OSError:
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _create_unique(
+    source: Path, destination: Path, taken: set[str], new_name: _NewName
+) -> Path:
     """Create ``destination`` (or ``stem_N.ext``) as a new name for ``source``."""
     candidate = destination
     counter = 1
     for _ in range(_MAX_RENAME_ATTEMPTS):
+        new_name.path, new_name.created = candidate, False
         try:
             _create_new(source, candidate)
-            return candidate
         except FileExistsError:
-            pass
+            new_name.path = None  # someone else's file
+        else:
+            new_name.created = True
+            return candidate
         while True:
             candidate = destination.with_name(
                 f"{destination.stem}_{counter}{destination.suffix}"

@@ -453,6 +453,31 @@ def test_source_delete_error_after_the_file_is_gone_keeps_the_moved_file(
     ]
 
 
+def test_ctrl_c_before_the_journal_write_leaves_no_unrecorded_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = _write(tmp_path / "src" / "a.txt", "payload")
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", [source])
+    real_link = os.link
+
+    def link_then_interrupt(*args, **kwargs):
+        real_link(*args, **kwargs)
+        raise KeyboardInterrupt  # pending SIGINT, raised as link returns
+
+    monkeypatch.setattr(os, "link", link_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        _execute(preview)
+    monkeypatch.undo()
+
+    assert source.read_text(encoding="utf-8") == "payload"
+    assert _organized_files(preview.target_folder) == []
+    assert read_journal(preview.journal_path).pending == []
+
+
 class _NearlyFullFile(io.FileIO):
     """A file on a disk with ``room`` bytes left; writing more raises ENOSPC."""
 
