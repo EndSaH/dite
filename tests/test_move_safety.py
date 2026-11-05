@@ -1139,3 +1139,36 @@ def test_cli_undo_passes_over_a_run_whose_files_are_gone_for_now(
     assert again.exit_code == 0, again.output
     assert second_file.read_text(encoding="utf-8") == "second run"
     assert find_latest_journal(target) is None
+
+
+def test_cli_undo_names_the_original_location_of_a_changed_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _write_cli_config(tmp_path, monkeypatch)
+    preview, files = _organize(tmp_path, ["deep/dir/thesis.txt"])
+    preview.operations[0].destination.write_text("edited", encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["undo", str(preview.target_folder), "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert str(files[0]) in "".join(result.output.split())
+
+
+def test_cli_undo_stops_with_a_clear_message_when_the_journal_cannot_be_written(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _write_cli_config(tmp_path, monkeypatch)
+    preview, files = _organize(tmp_path, ["a.txt", "b.txt"])
+
+    def disk_full(self, move_id):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(move_module.MoveJournal, "record_restored", disk_full)
+
+    result = CliRunner().invoke(app, ["undo", str(preview.target_folder), "--yes"])
+
+    assert result.exit_code == 1
+    assert not isinstance(result.exception, OSError)
+    assert "Undo stopped" in result.output
+    # The one file moved back before the error stays back.
+    assert files[1].read_text(encoding="utf-8") == "payload 1"

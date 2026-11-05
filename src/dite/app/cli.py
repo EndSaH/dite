@@ -1064,6 +1064,7 @@ def undo(
     for other in passed_over:
         logger.warning(t("undo_passed_over", path=escape(str(other))))
 
+    sources = {entry.destination: entry.source for entry in contents.entries}
     plan = undo_journal(journal_path, dry_run=True)
     logger.print(
         t(
@@ -1076,7 +1077,7 @@ def undo(
         logger.print(f"  {escape(str(destination))} -> {escape(str(source))}")
     if len(plan.restored) > 10:
         logger.print(t("organize_more_files", count=len(plan.restored) - 10))
-    _print_undo_skips(logger, plan.skipped)
+    _print_undo_skips(logger, plan.skipped, sources)
     if dry_run:
         return
     if not plan.restored:
@@ -1089,8 +1090,19 @@ def undo(
         logger.print(t("organize_cancelled"))
         return
 
-    result = undo_journal(journal_path)
-    _print_undo_skips(logger, result.skipped)
+    try:
+        result = undo_journal(journal_path)
+    except OSError as exc:
+        logger.error(
+            t(
+                "undo_stopped",
+                path=escape(str(journal_path)),
+                error=escape(str(exc)),
+                target=escape(str(path)),
+            )
+        )
+        raise typer.Exit(1) from exc
+    _print_undo_skips(logger, result.skipped, sources)
     logger.success(
         t("undo_done", restored=len(result.restored), skipped=len(result.skipped))
     )
@@ -1106,7 +1118,9 @@ def _print_undo_retry_hint(logger, result, path: Path) -> None:
         )
 
 
-def _print_undo_skips(logger, skipped: list[tuple[Path, str]]) -> None:
+def _print_undo_skips(
+    logger, skipped: list[tuple[Path, str]], sources: dict[Path, Path]
+) -> None:
     from rich.markup import escape
 
     for skipped_path, reason in skipped:
@@ -1116,7 +1130,8 @@ def _print_undo_skips(logger, skipped: list[tuple[Path, str]]) -> None:
         elif reason == "conflict":
             logger.warning(t("undo_skipped_conflict", path=shown))
         elif reason == "changed":
-            logger.warning(t("undo_skipped_changed", path=shown))
+            source = escape(str(sources.get(skipped_path, "?")))
+            logger.warning(t("undo_skipped_changed", path=shown, source=source))
         else:
             logger.warning(f"{shown}: {escape(reason)}")
 

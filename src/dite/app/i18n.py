@@ -133,6 +133,7 @@ class Messages:
     undo_done: str
     undo_partial: str
     undo_passed_over: str
+    undo_stopped: str
     undo_skipped_missing: str
     undo_skipped_conflict: str
     undo_skipped_changed: str
@@ -464,11 +465,15 @@ ZH_CN = Messages(
         "这份记录保持未撤销，文件回来后（例如改名的文件夹改回原名）"
         "再次运行 dite undo 会重新找到它"
     ),
+    undo_stopped=(
+        "撤销已中止：无法写入记录 {path}（{error}）。已经移回的文件保持不动；"
+        "解决问题（例如腾出磁盘空间）后再次运行 dite undo {target} 即可继续"
+    ),
     undo_skipped_missing="跳过（整理后的文件已不存在）: {path}",
     undo_skipped_conflict="跳过（原位置已有同名文件）: {path}",
     undo_skipped_changed=(
-        "跳过（整理后的文件已被修改或替换，不是当初移过去的那个；"
-        "它留在当前位置，需要的话请手动移回）: {path}"
+        "跳过（整理后的文件在移动之后被修改或替换过，所以留在原处）: {path}；"
+        "它原来在 {source}，需要的话请手动移回"
     ),
     assign_description="把新文件归入已有的子文件夹",
     cli_help_folder_assign="包含新文件的文件夹",
@@ -912,13 +917,19 @@ EN = Messages(
         "now (they are missing or were changed). It stays open, so dite undo "
         "finds it again once they are back (a renamed folder renamed back, say)"
     ),
+    undo_stopped=(
+        "Undo stopped: could not write to the journal {path} ({error}). Files "
+        "moved back so far stay back; fix the problem (free up disk space, "
+        "say) and run dite undo {target} again to continue"
+    ),
     undo_skipped_missing="Skipped (the moved file no longer exists): {path}",
     undo_skipped_conflict=(
         "Skipped (a file already exists at the original location): {path}"
     ),
     undo_skipped_changed=(
-        "Skipped (the moved file was changed or replaced since the move; it "
-        "stays where it is, move it back by hand if you want): {path}"
+        "Skipped (the moved file was changed or replaced since the move, so "
+        "it stays where it is): {path}; it came from {source}, move it back "
+        "by hand if you want"
     ),
     assign_description="Sort new files into existing subfolders",
     cli_help_folder_assign="Folder that contains the new files",
