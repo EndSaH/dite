@@ -234,6 +234,7 @@ class Messages:
     debug_scan_no_extension_label: str
     debug_scan_skipped_unsupported: str
     debug_scan_skipped_extension_count: str
+    debug_scan_skipped_ignored: str
     debug_scan_summary: str
     debug_extract_processing_file: str
     debug_extract_hash: str
@@ -553,6 +554,7 @@ ZH_CN = Messages(
     debug_scan_no_extension_label="(无扩展名)",
     debug_scan_skipped_unsupported="跳过 {count} 个不支持的文件",
     debug_scan_skipped_extension_count="  {extension}: {count} 个",
+    debug_scan_skipped_ignored="跳过 {dirs} 个忽略目录和 {files} 个忽略文件",
     debug_scan_summary=(
         "扫描完成: 支持文件 {supported} 个, "
         "排除目录内文件 {excluded} 个, 不支持文件 {skipped} 个"
@@ -972,6 +974,9 @@ EN = Messages(
     debug_scan_no_extension_label="(no extension)",
     debug_scan_skipped_unsupported="Skipped {count} unsupported files",
     debug_scan_skipped_extension_count="  {extension}: {count}",
+    debug_scan_skipped_ignored=(
+        "Skipped {dirs} ignored directories and {files} ignored files"
+    ),
     debug_scan_summary=(
         "Scan completed: {supported} supported, {excluded} excluded by path, "
         "{skipped} unsupported"

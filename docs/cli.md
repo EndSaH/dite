@@ -16,6 +16,17 @@
 
 当前没有全局 `--config` 选项。配置始终从 `~/.config/dite/config.yaml` 读取。
 
+## 扫描范围
+
+`scan`、`pdf-check`、`organize`、`assign` 用同一套规则查找文件：只收受支持扩展名的文件，并跳过下面这些条目。被跳过的目录整个不进入，里面的文件既不提取，也不会被整理移动。
+
+- 名字以 `.` 开头的目录和文件，例如 `.git`、`.venv`、`.obsidian`、`.DS_Store`、macOS 的 AppleDouble 元数据文件 `._*`。
+- 依赖和系统目录：`node_modules`、`__pycache__`、`site-packages`、`__MACOSX`、`$RECYCLE.BIN`、`System Volume Information`，以及包含 `pyvenv.cfg` 的 Python 虚拟环境（目录名不必带点，例如 `venv`、`env`）。
+- Finder 当成单个文件显示的 macOS 包目录，例如 `.app`、`.bundle`、`.framework`、`.plugin`、`.kext`、`.pkg`、`.photoslibrary`、`.musiclibrary`、`.tvlibrary`、`.imovielibrary`、`.fcpbundle`、`.logicx`、`.xcodeproj`、`.xcworkspace`、`.sparsebundle`、`.rtfd`、`.pages`。完整列表见 `src/dite/flow/scan.py` 中的 `PACKAGE_DIR_SUFFIXES`。
+- 临时和系统文件：Office 锁文件 `~$*`、`Thumbs.db`、`desktop.ini`。
+
+这些规则只检查命令参数所指目录之下的条目：直接把一个隐藏目录（或包目录、虚拟环境）作为参数传入时，它的内容照常扫描。名称比较不区分大小写。规则目前不可配置；`--verbose` 会打印跳过的目录和文件数量。
+
 ## `dite scan`
 
 用途：
