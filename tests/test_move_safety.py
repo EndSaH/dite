@@ -607,11 +607,14 @@ def test_second_signal_as_the_cleanup_starts_leaves_no_unrecorded_name(
     assert _organized_files(preview.target_folder) == []
     while (journal := find_latest_journal(preview.target_folder)) is not None:
         undo_journal(journal)
-    assert sorted(
-        path.relative_to(preview.target_folder).as_posix()
-        for path in preview.target_folder.rglob("*")
-        if JOURNAL_DIR_NAME not in path.parts
-    ) == []
+    assert (
+        sorted(
+            path.relative_to(preview.target_folder).as_posix()
+            for path in preview.target_folder.rglob("*")
+            if JOURNAL_DIR_NAME not in path.parts
+        )
+        == []
+    )
 
 
 def test_second_signal_during_an_undo_without_hard_links_leaves_no_claim_file(
