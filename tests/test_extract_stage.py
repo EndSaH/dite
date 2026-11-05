@@ -1,5 +1,6 @@
 """Per-file failure isolation and Ctrl+C handling in the extraction stage."""
 
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -10,6 +11,7 @@ from typer.testing import CliRunner
 from dite.app.cli import app
 from dite.app.config import Config
 from dite.app.i18n import set_locale
+from dite.cache import FileCache
 from dite.flow.api import PipelineOptions, PipelineService
 from dite.flow.extract import extract_stage
 from dite.flow.model import (
@@ -18,8 +20,10 @@ from dite.flow.model import (
     ExtractionWorkResult,
 )
 from dite.io.base import ExtractionResult
+from dite.io.pdf.final import PDFCacheWriteIntent
 from dite.io.pdf.render import PDFRenderResult
 from dite.io.pdf.vlm import extract_pdf_with_vlm_sampling
+from dite.io.types import ResolvedExtraction
 from dite.util.log import get_logger, setup_logging
 
 
@@ -198,6 +202,139 @@ def test_pipeline_records_unreadable_files_as_failed_without_extracting_them(
     assert reports[1].file_hash != reports[2].file_hash
     assert summary.duplicate_count == 0
     assert summary.primary_failures == 2
+
+
+_CACHE_CALL_ORDER = ["get_content", "get_vlm_content", "save", "update_vlm_content"]
+
+
+def _fake_pdf_primary_result(self, file_path, registry, docling_pdf_semaphore):
+    del self, registry, docling_pdf_semaphore
+    return ExtractionResult(
+        content=f"{file_path.stem} primary text",
+        success=True,
+        extractor="docling",
+    )
+
+
+def _fake_resolve_with_vlm_cache_write(file_path, client, **kwargs):
+    """A weak PDF whose fresh VLM text is selected and should be cached."""
+    del client
+    primary = kwargs["primary_result"]
+    vlm_text = f"{file_path.stem} vlm text"
+    return ResolvedExtraction(
+        primary_result=primary,
+        primary_effective_length=len(primary.content),
+        pdf_profile=None,
+        fallback_needed=True,
+        selected_source="vlm_api",
+        final_content=vlm_text,
+        final_effective_length=len(vlm_text),
+        vlm_content=vlm_text,
+        vlm_source="api",
+        vlm_api_success=True,
+        vlm_api_page_calls=1,
+        sample_page_limit=10,
+        cache_write_intent=PDFCacheWriteIntent(should_write=True, content=vlm_text),
+    )
+
+
+@pytest.mark.parametrize("failing", _CACHE_CALL_ORDER)
+@_ENTRY_POINTS
+def test_pipeline_keeps_extracted_content_when_the_cache_fails(
+    tmp_path: Path, monkeypatch, capsys, extract, failing: str
+) -> None:
+    set_locale("en")
+    setup_logging()
+    files = []
+    for name in ["a.pdf", "b.pdf"]:
+        path = tmp_path / name
+        path.write_bytes(f"%PDF-1.7 {name}".encode())
+        files.append(path)
+    cache = FileCache(db_path=tmp_path / "cache" / "cache.db")
+    calls: list[str] = []
+    for method in _CACHE_CALL_ORDER:
+        real = getattr(cache, method)
+
+        def call(*args, _method=method, _real=real, **kwargs):
+            calls.append(_method)
+            if _method == failing:
+                raise sqlite3.OperationalError("database is locked")
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(cache, method, call)
+    monkeypatch.setattr(
+        PipelineService, "_extract_primary_result", _fake_pdf_primary_result
+    )
+    monkeypatch.setattr(
+        "dite.flow.api.resolve_document_extraction",
+        _fake_resolve_with_vlm_cache_write,
+    )
+    service = PipelineService(client=object(), config=Config(), cache=cache)
+
+    try:
+        contents, reports, summary = extract(
+            service,
+            files,
+            PipelineOptions(use_cache=True, use_embedding_cache=False),
+        )
+    finally:
+        cache.close()
+
+    # A cache error costs only the speed-up: the extracted text is kept.
+    assert contents == ["a vlm text", "b vlm text"]
+    assert [report.primary_success for report in reports] == [True, True]
+    assert [report.primary_error for report in reports] == [None, None]
+    assert summary.primary_failures == 0
+    # After its first cache error a file leaves the cache alone.
+    skipped = _CACHE_CALL_ORDER[_CACHE_CALL_ORDER.index(failing) + 1 :]
+    assert calls.count(failing) == 2
+    assert not set(calls) & set(skipped), calls
+    output = " ".join(capsys.readouterr().out.split())
+    assert output.count("Cache read/write failed for") == 2
+    assert output.count("OperationalError: database is locked") == 2
+
+
+@_ENTRY_POINTS
+def test_pipeline_keeps_the_content_of_a_file_deleted_after_extraction(
+    tmp_path: Path, monkeypatch, capsys, extract
+) -> None:
+    set_locale("en")
+    setup_logging()
+    files = _write_files(tmp_path, ["a.txt", "b.txt"])
+
+    def fake_extract_document(file_path, client, registry=None, config=None):
+        del client, registry, config
+        result = ExtractionResult(
+            content=f"{file_path.stem} content long enough",
+            success=True,
+            extractor="text",
+        )
+        if file_path.name == "b.txt":
+            # Gone before its cache row, which needs the mtime, is written.
+            file_path.unlink()
+        return result
+
+    monkeypatch.setattr("dite.io.route.extract_document", fake_extract_document)
+    cache = FileCache(db_path=tmp_path / "cache" / "cache.db")
+    service = PipelineService(client=object(), config=Config(), cache=cache)
+
+    try:
+        contents, reports, summary = extract(
+            service,
+            files,
+            PipelineOptions(use_cache=True, use_embedding_cache=False),
+        )
+        cached_a, _source = cache.get_content(files[0], reports[0].file_hash)
+    finally:
+        cache.close()
+
+    assert contents == ["a content long enough", "b content long enough"]
+    assert [report.primary_success for report in reports] == [True, True]
+    assert summary.primary_failures == 0
+    assert cached_a == "a content long enough"
+    output = " ".join(capsys.readouterr().out.split())
+    assert output.count("Cache read/write failed for") == 1
+    assert "FileNotFoundError" in output
 
 
 def test_extract_stage_stops_starting_files_after_keyboard_interrupt(

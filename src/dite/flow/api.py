@@ -37,7 +37,7 @@ from dite.io.route import (
 from dite.util.api import AsyncRequestRuntime
 from dite.util.log import get_logger
 
-from .extract import extract_stage
+from .extract import BestEffortCache, extract_stage
 from .model import (
     ExtractionFileReport,
     ExtractionSummary,
@@ -196,10 +196,13 @@ class PipelineService:
         vlm_cache_hits = 0
         primary_result = None
         cached_vlm_content = None
+        item_cache = BestEffortCache(
+            self.cache, enabled=options.use_cache, file=file, logger=self.logger
+        )
 
-        if options.use_cache and self.cache:
-            cached_primary_content, source_file = self.cache.get_content(
-                file, file_hash
+        if item_cache.available:
+            cached_primary_content, source_file = item_cache.run(
+                lambda cache: cache.get_content(file, file_hash), (None, None)
             )
             if cached_primary_content:
                 extractor = get_extractor(
@@ -225,11 +228,14 @@ class PipelineService:
             else:
                 self.logger.debug(t("debug_extract_doc_cache_miss"))
 
-        if file.suffix.lower() == ".pdf" and options.use_cache and self.cache:
-            cached_vlm_content = self.cache.get_vlm_content(
-                file,
-                file_hash,
-                VLM_CACHE_VERSION,
+        if file.suffix.lower() == ".pdf" and item_cache.available:
+            cached_vlm_content = item_cache.run(
+                lambda cache: cache.get_vlm_content(
+                    file,
+                    file_hash,
+                    VLM_CACHE_VERSION,
+                ),
+                None,
             )
             if cached_vlm_content:
                 vlm_cache_hits = 1
@@ -277,32 +283,36 @@ class PipelineService:
         )
 
         if (
-            options.use_cache
-            and self.cache
+            item_cache.available
             and resolved.primary_result.success
             and doc_cache_hits == 0
         ):
-            self.cache.save(
-                file_path=file,
-                file_hash=file_hash,
-                file_mtime=file.stat().st_mtime,
-                content_md=resolved.primary_result.content,
-                model_version=self.config.models.embedding,
-                enforce_size_limit=False,
+            item_cache.run(
+                lambda cache: cache.save(
+                    file_path=file,
+                    file_hash=file_hash,
+                    file_mtime=file.stat().st_mtime,
+                    content_md=resolved.primary_result.content,
+                    model_version=self.config.models.embedding,
+                    enforce_size_limit=False,
+                ),
+                None,
             )
 
         if (
             resolved.cache_write_intent.should_write
             and resolved.cache_write_intent.content
-            and options.use_cache
-            and self.cache
+            and item_cache.available
         ):
-            self.cache.update_vlm_content(
-                file,
-                file_hash,
-                resolved.cache_write_intent.content,
-                VLM_CACHE_VERSION,
-                enforce_size_limit=False,
+            item_cache.run(
+                lambda cache: cache.update_vlm_content(
+                    file,
+                    file_hash,
+                    resolved.cache_write_intent.content,
+                    VLM_CACHE_VERSION,
+                    enforce_size_limit=False,
+                ),
+                None,
             )
 
         if len(resolved.final_content) > truncate_limit:

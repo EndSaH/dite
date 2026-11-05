@@ -7,14 +7,16 @@ import dataclasses
 import hashlib
 import itertools
 import os
+import sqlite3
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from rich.markup import escape
 
 from dite.app.i18n import t
-from dite.cache import VLM_CACHE_VERSION
+from dite.cache import VLM_CACHE_VERSION, FileCache
 from dite.io import get_extractor
 from dite.util.cancel import cancellation_scope, raise_if_cancelled
 from dite.util.hash import compute_file_hash
@@ -65,15 +67,60 @@ def _unreadable_file_hash(file: Path) -> str:
     return "unreadable:" + hashlib.sha256(os.fsencode(file)).hexdigest()
 
 
+def _describe_error(error: Exception) -> str:
+    message = f"{type(error).__name__}: {error}"
+    if len(message) > _FAILURE_MESSAGE_LIMIT:
+        message = message[:_FAILURE_MESSAGE_LIMIT] + "..."
+    return message
+
+
+# A cache database that is locked, full, read-only or corrupt, or a file whose
+# mtime can no longer be read for its cache row.
+_CACHE_ERRORS = (sqlite3.Error, OSError)
+
+
+class BestEffortCache:
+    """Cache access for one file that never fails the file.
+
+    The cache only saves work. When a lookup or a write raises, a warning is
+    logged, the cache is left alone for the rest of this file, and the file is
+    extracted and keeps its content as if it had no cache.
+    """
+
+    def __init__(self, cache, *, enabled: bool, file: Path, logger) -> None:
+        self._cache = cache if enabled and cache else None
+        self._file = file
+        self._logger = logger
+
+    @property
+    def available(self) -> bool:
+        return self._cache is not None
+
+    def run[T](self, operation: Callable[[FileCache], T], default: T) -> T:
+        """Return ``operation(cache)``, or ``default`` if the cache is unusable."""
+        if self._cache is None:
+            return default
+        try:
+            return operation(self._cache)
+        except _CACHE_ERRORS as exc:
+            self._cache = None
+            self._logger.warning(
+                t(
+                    "warning_extract_cache_failed",
+                    path=escape(str(self._file)),
+                    error=escape(_describe_error(exc)),
+                )
+            )
+            return default
+
+
 def _failed_work_result(
     item: ExtractionWorkItem,
     error: Exception,
     logger,
 ) -> ExtractionWorkResult:
     """Record a file whose extraction raised, so the rest of the run goes on."""
-    message = f"{type(error).__name__}: {error}"
-    if len(message) > _FAILURE_MESSAGE_LIMIT:
-        message = message[:_FAILURE_MESSAGE_LIMIT] + "..."
+    message = _describe_error(error)
     logger.warning(
         t(
             "warning_extract_file_failed",
@@ -131,9 +178,14 @@ def extract_content_work_item(
     vlm_cache_hits = 0
     primary_result = None
     cached_vlm_content = None
+    item_cache = BestEffortCache(
+        cache, enabled=options.use_cache, file=file, logger=logger
+    )
 
-    if options.use_cache and cache:
-        cached_primary_content, source_file = cache.get_content(file, file_hash)
+    if item_cache.available:
+        cached_primary_content, source_file = item_cache.run(
+            lambda cache: cache.get_content(file, file_hash), (None, None)
+        )
         if cached_primary_content:
             extractor = get_extractor(
                 file,
@@ -158,11 +210,10 @@ def extract_content_work_item(
         else:
             logger.debug(t("debug_extract_doc_cache_miss"))
 
-    if file.suffix.lower() == ".pdf" and options.use_cache and cache:
-        cached_vlm_content = cache.get_vlm_content(
-            file,
-            file_hash,
-            VLM_CACHE_VERSION,
+    if file.suffix.lower() == ".pdf" and item_cache.available:
+        cached_vlm_content = item_cache.run(
+            lambda cache: cache.get_vlm_content(file, file_hash, VLM_CACHE_VERSION),
+            None,
         )
         if cached_vlm_content:
             vlm_cache_hits = 1
@@ -203,33 +254,33 @@ def extract_content_work_item(
         **resolve_kwargs,
     )
 
-    if (
-        options.use_cache
-        and cache
-        and resolved.primary_result.success
-        and doc_cache_hits == 0
-    ):
-        cache.save(
-            file_path=file,
-            file_hash=file_hash,
-            file_mtime=file.stat().st_mtime,
-            content_md=resolved.primary_result.content,
-            model_version=config.models.embedding,
-            enforce_size_limit=False,
+    if item_cache.available and resolved.primary_result.success and doc_cache_hits == 0:
+        item_cache.run(
+            lambda cache: cache.save(
+                file_path=file,
+                file_hash=file_hash,
+                file_mtime=file.stat().st_mtime,
+                content_md=resolved.primary_result.content,
+                model_version=config.models.embedding,
+                enforce_size_limit=False,
+            ),
+            None,
         )
 
     if (
         resolved.cache_write_intent.should_write
         and resolved.cache_write_intent.content
-        and options.use_cache
-        and cache
+        and item_cache.available
     ):
-        cache.update_vlm_content(
-            file,
-            file_hash,
-            resolved.cache_write_intent.content,
-            VLM_CACHE_VERSION,
-            enforce_size_limit=False,
+        item_cache.run(
+            lambda cache: cache.update_vlm_content(
+                file,
+                file_hash,
+                resolved.cache_write_intent.content,
+                VLM_CACHE_VERSION,
+                enforce_size_limit=False,
+            ),
+            None,
         )
 
     from dite.doc.embed import ContentTruncator
