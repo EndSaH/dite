@@ -175,6 +175,7 @@ class Messages:
     error_processing_failed: str
     error_docling_pdf_models_missing: str
     error_docling_pdf_timeout: str
+    error_docling_pdf_subprocess_failed: str
     error_pdf_render_failed: str
     error_pdf_vlm_no_usable_content: str
     error_text_decode_failed: str
@@ -508,6 +509,9 @@ ZH_CN = Messages(
     error_processing_failed="处理失败: {error}",
     error_docling_pdf_models_missing="Docling PDF 模型未安装。请先运行 `{command}`。",
     error_docling_pdf_timeout="Docling PDF 提取超时: {seconds:g}s",
+    error_docling_pdf_subprocess_failed=(
+        "Docling PDF 子进程未返回结果就退出了（退出码 {exitcode}）"
+    ),
     error_pdf_render_failed="PDF 渲染失败",
     error_pdf_vlm_no_usable_content="VLM 回退未返回任何可用内容",
     error_text_decode_failed="无法解码文件，尝试的编码: {encodings}",
@@ -932,6 +936,9 @@ EN = Messages(
         "Docling PDF models are not installed. Run `{command}` first."
     ),
     error_docling_pdf_timeout="Docling PDF extraction timed out after {seconds:g}s",
+    error_docling_pdf_subprocess_failed=(
+        "Docling PDF subprocess exited without a result (exit code {exitcode})"
+    ),
     error_pdf_render_failed="PDF rendering failed",
     error_pdf_vlm_no_usable_content="VLM fallback returned no usable content",
     error_text_decode_failed=(

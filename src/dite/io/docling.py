@@ -14,6 +14,8 @@ from dite.util.log import silence_docling_logging
 from .base import BaseExtractor, ExtractionResult
 
 _DOCLING_PDF_SETUP_COMMAND = "uv run dite setup docling-pdf"
+# How long a child that has already sent its result gets to exit by itself.
+_DOCLING_PDF_CHILD_EXIT_GRACE_SEC = 5.0
 
 
 class DoclingPDFTimeoutError(TimeoutError):
@@ -130,6 +132,24 @@ def _docling_pdf_extract_child(
         conn.close()
 
 
+def _stop_process(process: multiprocessing.process.BaseProcess) -> None:
+    """Terminate a running child and reap it so it does not linger."""
+    process.terminate()
+    process.join(1)
+    if process.is_alive():
+        process.kill()
+        process.join()
+
+
+def _describe_exit_code(exitcode: int | None) -> str:
+    if exitcode is not None and exitcode < 0:
+        try:
+            return f"{exitcode}, {signal.Signals(-exitcode).name}"
+        except ValueError:
+            pass
+    return str(exitcode)
+
+
 def extract_docling_pdf_in_subprocess(
     file_path: Path,
     *,
@@ -155,16 +175,16 @@ def extract_docling_pdf_in_subprocess(
         ),
     )
 
+    started = False
     try:
         process.start()
+        started = True
         child_conn.close()
-        process.join(timeout_sec)
-        if process.is_alive():
-            process.terminate()
-            process.join(1)
-            if process.is_alive():
-                process.kill()
-                process.join()
+        # Read the result while the child is still running. A result larger
+        # than the pipe buffer (64 KiB on Linux) keeps the child blocked in
+        # send() until it is read, so waiting for the child to exit first
+        # would only end at the timeout.
+        if not parent_conn.poll(timeout_sec):
             return ExtractionResult(
                 content="",
                 success=False,
@@ -175,16 +195,30 @@ def extract_docling_pdf_in_subprocess(
                 ),
             )
 
-        if parent_conn.poll():
-            return parent_conn.recv()
-
-        return ExtractionResult(
-            content="",
-            success=False,
-            extractor=DoclingExtractor.name,
-            error=f"Docling subprocess failed with exit code {process.exitcode}",
-        )
+        try:
+            result = parent_conn.recv()
+        except (EOFError, OSError):
+            # poll() also returns on EOF: the child died without sending a
+            # result, e.g. killed by the OOM killer or a crash in native code.
+            process.join(_DOCLING_PDF_CHILD_EXIT_GRACE_SEC)
+            if process.is_alive():
+                _stop_process(process)
+            return ExtractionResult(
+                content="",
+                success=False,
+                extractor=DoclingExtractor.name,
+                error=t(
+                    "error_docling_pdf_subprocess_failed",
+                    exitcode=_describe_exit_code(process.exitcode),
+                ),
+            )
+        process.join(_DOCLING_PDF_CHILD_EXIT_GRACE_SEC)
+        return result
     finally:
+        # Timeout, or an interrupt while waiting: do not leave the child
+        # running or unreaped.
+        if started and process.is_alive():
+            _stop_process(process)
         parent_conn.close()
 
 

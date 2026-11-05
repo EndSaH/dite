@@ -1,5 +1,8 @@
+import multiprocessing
 import time
 from pathlib import Path
+
+import docling_child_helpers
 
 from dite.app.i18n import set_locale
 from dite.io.base import ExtractionResult
@@ -191,7 +194,8 @@ def test_extract_docling_pdf_in_subprocess_returns_child_result(
             self._result = result
             self.closed = False
 
-        def poll(self) -> bool:
+        def poll(self, timeout=None) -> bool:
+            del timeout
             return self._result is not None
 
         def recv(self) -> ExtractionResult:
@@ -245,7 +249,8 @@ def test_extract_docling_pdf_in_subprocess_returns_child_result(
 
     assert result == expected
     assert captured["started"] is True
-    assert captured["join_calls"] == [0.5]
+    # The child is reaped after its result has been read.
+    assert captured["join_calls"]
 
 
 def test_docling_pdf_extract_child_silences_docling_logging_before_extract(
@@ -319,7 +324,8 @@ def test_extract_docling_pdf_in_subprocess_times_out_and_terminates(
     lifecycle: list[str] = []
 
     class _Conn:
-        def poll(self) -> bool:
+        def poll(self, timeout=None) -> bool:
+            del timeout
             return False
 
         def recv(self) -> ExtractionResult:
@@ -482,3 +488,80 @@ def test_pipeline_passes_page_limit_to_docling_subprocess(monkeypatch) -> None:
     )
 
     assert captured["max_pages"] == config.processing.docling_pdf_max_pages == 50
+
+
+def _extract_with_real_child(
+    tmp_path: Path, monkeypatch, child, *, timeout_sec: float
+) -> tuple[ExtractionResult, float]:
+    """Run the real spawn-based wrapper with ``child`` as the child body."""
+    set_locale("en")
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.7")
+    monkeypatch.setattr("dite.io.docling._docling_pdf_extract_child", child)
+    started = time.monotonic()
+    result = extract_docling_pdf_in_subprocess(
+        pdf_path,
+        timeout_sec=timeout_sec,
+        locale="en",
+    )
+    return result, time.monotonic() - started
+
+
+def test_extract_docling_pdf_in_subprocess_reads_results_larger_than_a_pipe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    children_before = set(multiprocessing.active_children())
+
+    result, elapsed = _extract_with_real_child(
+        tmp_path,
+        monkeypatch,
+        docling_child_helpers.send_large_result,
+        timeout_sec=20,
+    )
+
+    assert result.success is True, result.error
+    assert len(result.content) == docling_child_helpers.LARGE_CONTENT_SIZE
+    # The child sends at once; running into the timeout means the parent
+    # waited for an exit while the child was blocked on a full pipe.
+    assert elapsed < 10
+    assert set(multiprocessing.active_children()) <= children_before
+
+
+def test_extract_docling_pdf_in_subprocess_reports_a_killed_child_as_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    children_before = set(multiprocessing.active_children())
+
+    result, elapsed = _extract_with_real_child(
+        tmp_path,
+        monkeypatch,
+        docling_child_helpers.die_without_result,
+        timeout_sec=20,
+    )
+
+    assert result.success is False
+    assert result.content == ""
+    assert result.extractor == "docling"
+    assert result.error == (
+        "Docling PDF subprocess exited without a result (exit code -9, SIGKILL)"
+    )
+    assert elapsed < 10
+    assert set(multiprocessing.active_children()) <= children_before
+
+
+def test_extract_docling_pdf_in_subprocess_terminates_a_child_that_overruns(
+    tmp_path: Path, monkeypatch
+) -> None:
+    children_before = set(multiprocessing.active_children())
+
+    result, elapsed = _extract_with_real_child(
+        tmp_path,
+        monkeypatch,
+        docling_child_helpers.sleep_forever,
+        timeout_sec=1,
+    )
+
+    assert result.success is False
+    assert result.error == "Docling PDF extraction timed out after 1s"
+    assert elapsed < 10
+    assert set(multiprocessing.active_children()) <= children_before
