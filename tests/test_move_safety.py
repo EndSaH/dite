@@ -626,6 +626,23 @@ def test_partial_undo_can_be_retried(tmp_path: Path) -> None:
     assert _organized_files(preview.target_folder) == []
 
 
+def test_undo_keeps_the_restored_file_when_a_delete_error_comes_late(
+    tmp_path: Path, monkeypatch
+) -> None:
+    preview, files = _organize(tmp_path, ["a.txt"])
+    moved = preview.operations[0].destination
+    _break_unlink_after_removing(
+        monkeypatch, moved, OSError(errno.EIO, "Input/output error")
+    )
+
+    result = undo_journal(preview.journal_path)
+    monkeypatch.undo()
+
+    assert files[0].read_text(encoding="utf-8") == "payload 0"
+    assert not moved.exists()
+    assert result.skipped == []
+
+
 def test_undo_skips_files_replaced_after_the_move(tmp_path: Path) -> None:
     preview, files = _organize(tmp_path, ["a.txt", "b.txt"])
     replaced, touched = (op.destination for op in preview.operations)

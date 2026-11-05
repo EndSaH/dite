@@ -927,8 +927,14 @@ def _undo_move(entry: JournalMove, *, dry_run: bool) -> tuple[Path, str] | None:
     try:
         os.unlink(destination)
     except OSError as exc:
-        with suppress(OSError):
-            os.unlink(source)
+        # As in _move_file: drop the name just made only while the organized
+        # one is known to be there, or the file may be left under neither.
+        destination_exists = _lexists_or_none(destination)
+        if destination_exists is False:
+            return None  # deleted after all: the file is back
+        if destination_exists:
+            with suppress(OSError):
+                os.unlink(source)
         return destination, str(exc)
     return None
 
