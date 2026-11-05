@@ -131,8 +131,10 @@ class Messages:
     undo_preview: str
     undo_confirm: str
     undo_done: str
+    undo_partial: str
     undo_skipped_missing: str
     undo_skipped_conflict: str
+    undo_skipped_changed: str
     assign_description: str
     cli_help_folder_assign: str
     cli_help_assign_target: str
@@ -452,8 +454,15 @@ ZH_CN = Messages(
     undo_preview="将把 {count} 个文件移回原位（记录: {path}）",
     undo_confirm="确认撤销这些移动?",
     undo_done="撤销完成: {restored} 个已移回, {skipped} 个跳过",
+    undo_partial=(
+        "{count} 个文件没有移回，这份记录保持未撤销；处理好上面的问题后"
+        "再次运行 dite undo {path} 即可重试"
+    ),
     undo_skipped_missing="跳过（整理后的文件已不存在）: {path}",
     undo_skipped_conflict="跳过（原位置已有同名文件）: {path}",
+    undo_skipped_changed=(
+        "跳过（整理后的文件已被修改或替换，不是当初移过去的那个）: {path}"
+    ),
     assign_description="把新文件归入已有的子文件夹",
     cli_help_folder_assign="包含新文件的文件夹",
     cli_help_assign_target=(
@@ -887,9 +896,16 @@ EN = Messages(
     undo_preview="{count} files will be moved back (journal: {path})",
     undo_confirm="Undo these moves?",
     undo_done="Undo finished: {restored} restored, {skipped} skipped",
+    undo_partial=(
+        "{count} files were not moved back, so the journal stays open; fix "
+        "the problems above and run dite undo {path} again to retry them"
+    ),
     undo_skipped_missing="Skipped (the moved file no longer exists): {path}",
     undo_skipped_conflict=(
         "Skipped (a file already exists at the original location): {path}"
+    ),
+    undo_skipped_changed=(
+        "Skipped (the moved file was changed or replaced since the move): {path}"
     ),
     assign_description="Sort new files into existing subfolders",
     cli_help_folder_assign="Folder that contains the new files",

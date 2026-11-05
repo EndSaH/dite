@@ -17,11 +17,14 @@ from pathlib import Path
 
 import pytest
 from rich.console import Console
+from typer.testing import CliRunner
 
+from dite.app.cli import app
 from dite.flow.move import (
     JOURNAL_DIR_NAME,
     FileOperation,
     OrganizePreview,
+    find_latest_journal,
     read_journal,
     undo_journal,
 )
@@ -382,3 +385,158 @@ def test_journal_records_each_move_before_the_source_is_deleted(
     assert _execute(preview) == (1, 0)
 
     assert seen_in_journal == [True]
+
+
+# ASSIGN-10: partial undo can be retried, moved files are verified.
+
+
+def test_undo_cleans_up_after_a_move_interrupted_before_the_delete(
+    tmp_path: Path,
+) -> None:
+    preview, files = _organize(tmp_path, ["a.txt"])
+    moved = preview.operations[0].destination
+    # The process died after the journal write but before the source delete.
+    os.link(moved, files[0])
+
+    result = undo_journal(preview.journal_path)
+
+    assert result.skipped == []
+    assert len(result.restored) == 1
+    assert files[0].read_text(encoding="utf-8") == "payload 0"
+    assert not moved.exists()
+    assert read_journal(preview.journal_path).undone is True
+
+
+def test_partial_undo_can_be_retried(tmp_path: Path) -> None:
+    preview, files = _organize(tmp_path, ["a.txt", "sub/b.txt"])
+    files[0].write_text("placeholder", encoding="utf-8")
+
+    first = undo_journal(preview.journal_path)
+
+    assert len(first.restored) == 1
+    assert first.skipped == [(files[0], "conflict")]
+    assert read_journal(preview.journal_path).undone is False
+    assert find_latest_journal(preview.target_folder) == preview.journal_path
+
+    files[0].unlink()
+    second = undo_journal(preview.journal_path)
+
+    # Only the file left behind is retried; b.txt is not reported missing.
+    assert [source for _, source in second.restored] == [files[0]]
+    assert second.skipped == []
+    assert read_journal(preview.journal_path).undone is True
+    for index, path in enumerate(files):
+        assert path.read_text(encoding="utf-8") == f"payload {index}"
+    assert _organized_files(preview.target_folder) == []
+
+
+def test_undo_skips_files_replaced_after_the_move(tmp_path: Path) -> None:
+    preview, files = _organize(tmp_path, ["a.txt", "b.txt"])
+    replaced, touched = (op.destination for op in preview.operations)
+    replaced.unlink()
+    replaced.write_text("a different file", encoding="utf-8")
+    stat = touched.stat()
+    touched.write_text("payload X", encoding="utf-8")  # same size
+    os.utime(touched, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+
+    plan = undo_journal(preview.journal_path, dry_run=True)
+    result = undo_journal(preview.journal_path)
+
+    for outcome in (plan, result):
+        assert outcome.restored == []
+        assert sorted(outcome.skipped) == sorted(
+            [(replaced, "changed"), (touched, "changed")]
+        )
+    assert not any(path.exists() for path in files)
+    assert replaced.read_text(encoding="utf-8") == "a different file"
+    assert touched.read_text(encoding="utf-8") == "payload X"
+    # A retry cannot fix this, so the journal does not stay open for it.
+    assert read_journal(preview.journal_path).undone is True
+
+
+def test_undo_still_reads_journals_without_file_identity(tmp_path: Path) -> None:
+    source = tmp_path / "src" / "a.txt"
+    moved = _write(tmp_path / "out" / "Topic" / "a.txt", "payload")
+    journal = tmp_path / "out" / JOURNAL_DIR_NAME / "organize-20250101-000000-0.jsonl"
+    journal.parent.mkdir(parents=True)
+    journal.write_text(
+        "\n".join(
+            [
+                '{"type": "header", "version": 1, "created_at": "2025-01-01T00:00:00",'
+                f' "source_folder": "{tmp_path / "src"}",'
+                f' "target_folder": "{tmp_path / "out"}"}}',
+                f'{{"type": "mkdir", "path": "{tmp_path / "out" / "Topic"}"}}',
+                f'{{"type": "move", "source": "{source}", "destination": "{moved}"}}',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert find_latest_journal(tmp_path / "out") == journal
+    result = undo_journal(journal)
+
+    assert result.skipped == []
+    assert source.read_text(encoding="utf-8") == "payload"
+    assert not (tmp_path / "out" / "Topic").exists()
+    assert read_journal(journal).undone is True
+
+
+def _write_cli_config(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    config_path = home / ".config" / "dite" / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                "api:",
+                "  base_url: https://api.example.com/v1",
+                "  api_key: dummy-key",
+                "cache:",
+                f"  directory: {tmp_path / 'cache'}",
+                "i18n:",
+                "  locale: en",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_cli_undo_reports_partial_undo_and_retries(tmp_path: Path, monkeypatch) -> None:
+    _write_cli_config(tmp_path, monkeypatch)
+    preview, files = _organize(tmp_path, ["a.txt", "b.txt"])
+    files[1].write_text("placeholder", encoding="utf-8")
+    runner = CliRunner()
+
+    first = runner.invoke(app, ["undo", str(preview.target_folder), "--yes"])
+
+    assert first.exit_code == 0, first.output
+    # The retry hint names the command (rich may wrap the line anywhere).
+    assert "dite undo" in " ".join(first.output.split())
+    assert files[0].read_text(encoding="utf-8") == "payload 0"
+
+    files[1].unlink()
+    second = runner.invoke(app, ["undo", str(preview.target_folder), "--yes"])
+
+    assert second.exit_code == 0, second.output
+    assert files[1].read_text(encoding="utf-8") == "payload 1"
+    assert read_journal(preview.journal_path).undone is True
+
+
+def test_cli_undo_closes_a_journal_once_only_final_skips_remain(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _write_cli_config(tmp_path, monkeypatch)
+    preview, files = _organize(tmp_path, ["a.txt", "b.txt"])
+    files[1].write_text("placeholder", encoding="utf-8")
+    assert len(undo_journal(preview.journal_path).restored) == 1
+    # The user keeps the new b.txt and deletes the organized one instead.
+    preview.operations[1].destination.unlink()
+
+    result = CliRunner().invoke(app, ["undo", str(preview.target_folder), "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert read_journal(preview.journal_path).undone is True
+    assert find_latest_journal(preview.target_folder) is None
+    assert files[1].read_text(encoding="utf-8") == "placeholder"

@@ -1071,7 +1071,12 @@ def undo(
     if dry_run:
         return
     if not plan.restored:
+        if not plan.retryable:
+            # Nothing a retry could move back: close the journal so the next
+            # `dite undo` goes on to the run before this one.
+            undo_journal(journal_path)
         logger.success(t("undo_done", restored=0, skipped=len(plan.skipped)))
+        _print_undo_retry_hint(logger, plan, path)
         return
     if not yes and not typer.confirm(t("undo_confirm")):
         logger.print(t("organize_cancelled"))
@@ -1082,6 +1087,16 @@ def undo(
     logger.success(
         t("undo_done", restored=len(result.restored), skipped=len(result.skipped))
     )
+    _print_undo_retry_hint(logger, result, path)
+
+
+def _print_undo_retry_hint(logger, result, path: Path) -> None:
+    from rich.markup import escape
+
+    if result.retryable:
+        logger.warning(
+            t("undo_partial", count=len(result.retryable), path=escape(str(path)))
+        )
 
 
 def _print_undo_skips(logger, skipped: list[tuple[Path, str]]) -> None:
@@ -1093,6 +1108,8 @@ def _print_undo_skips(logger, skipped: list[tuple[Path, str]]) -> None:
             logger.warning(t("undo_skipped_missing", path=shown))
         elif reason == "conflict":
             logger.warning(t("undo_skipped_conflict", path=shown))
+        elif reason == "changed":
+            logger.warning(t("undo_skipped_changed", path=shown))
         else:
             logger.warning(f"{shown}: {escape(reason)}")
 

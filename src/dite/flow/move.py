@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import errno
+import filecmp
 import json
 import os
 import shlex
 import shutil
+import stat
 import unicodedata
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -550,6 +552,11 @@ class MoveJournal:
         )
         return journal
 
+    @classmethod
+    def reopen(cls, path: Path) -> MoveJournal:
+        """Open an existing journal to append undo records to it."""
+        return cls(path, _open_journal(path, "a"))
+
     def _write(self, record: dict[str, Any]) -> None:
         self._handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         self._handle.flush()
@@ -560,15 +567,22 @@ class MoveJournal:
         self._write({"type": "mkdir", "path": str(Path(directory).resolve())})
 
     def record_move(self, source: Path, destination: Path) -> int:
-        """Record a move before its source is deleted; returns its id."""
+        """Record a move before its source is deleted; returns its id.
+
+        The size and mtime of the new file let undo check that what it
+        moves back is still the file that was moved.
+        """
         move_id = self._next_move_id
         self._next_move_id += 1
+        info = os.lstat(destination)
         self._write(
             {
                 "type": "move",
                 "id": move_id,
                 "source": str(Path(source).absolute()),
                 "destination": str(Path(destination).resolve()),
+                "size": info.st_size,
+                "mtime_ns": info.st_mtime_ns,
             }
         )
         return move_id
@@ -577,8 +591,33 @@ class MoveJournal:
         """The move was rolled back because its source could not be deleted."""
         self._write({"type": "cancel", "id": move_id})
 
+    def record_restored(self, move_id: int) -> None:
+        """Undo moved this file back; a retried undo leaves it alone."""
+        self._write({"type": "restored", "id": move_id})
+
+    def record_undone(self, *, restored: int, skipped: int) -> None:
+        self._write(
+            {
+                "type": "undone",
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "restored": restored,
+                "skipped": skipped,
+            }
+        )
+
     def close(self) -> None:
         self._handle.close()
+
+
+@dataclass(frozen=True)
+class JournalMove:
+    """One recorded move. Older journals carry no size or mtime."""
+
+    id: int
+    source: Path
+    destination: Path
+    size: int | None = None
+    mtime_ns: int | None = None
 
 
 @dataclass
@@ -590,13 +629,21 @@ class JournalContents:
     moves: list[tuple[Path, Path]]  # (source, destination), in execution order
     created_dirs: list[Path]
     undone: bool
+    entries: list[JournalMove] = field(default_factory=list)  # same order
+    restored_ids: set[int] = field(default_factory=set)  # moved back already
+
+    @property
+    def pending(self) -> list[JournalMove]:
+        """Moves an undo still has to reverse."""
+        return [entry for entry in self.entries if entry.id not in self.restored_ids]
 
 
 def read_journal(path: Path) -> JournalContents:
     """Load a move journal written by ``OrganizePreview.execute``."""
     header: dict[str, Any] = {}
-    moves: dict[int, tuple[Path, Path]] = {}
+    moves: dict[int, JournalMove] = {}
     move_count = 0
+    restored_ids: set[int] = set()
     created_dirs: list[Path] = []
     undone = False
     with _open_journal(path, "r") as handle:
@@ -612,9 +659,17 @@ def read_journal(path: Path) -> JournalContents:
                 # Older journals have no ids: a move's id is its position.
                 move_id = record.get("id", move_count)
                 move_count += 1
-                moves[move_id] = (Path(record["source"]), Path(record["destination"]))
+                moves[move_id] = JournalMove(
+                    id=move_id,
+                    source=Path(record["source"]),
+                    destination=Path(record["destination"]),
+                    size=record.get("size"),
+                    mtime_ns=record.get("mtime_ns"),
+                )
             elif kind == "cancel":
                 moves.pop(record.get("id"), None)
+            elif kind == "restored":
+                restored_ids.add(record.get("id"))
             elif kind == "mkdir":
                 created_dirs.append(Path(record["path"]))
             elif kind == "undone":
@@ -624,17 +679,20 @@ def read_journal(path: Path) -> JournalContents:
     return JournalContents(
         path=path,
         header=header,
-        moves=list(moves.values()),
+        moves=[(entry.source, entry.destination) for entry in moves.values()],
         created_dirs=created_dirs,
         undone=undone,
+        entries=list(moves.values()),
+        restored_ids=restored_ids,
     )
 
 
 def find_latest_journal(target_folder: Path) -> Path | None:
     """Return the newest journal under ``target/.dite`` with moves to undo.
 
-    Journals that are already undone, or that recorded no successful move
-    (every copy failed), are skipped.
+    Journals that are already undone, or that have no move left to undo
+    (every copy failed, or a partial undo already moved everything back),
+    are skipped.
     """
     journal_dir = Path(target_folder) / JOURNAL_DIR_NAME
     if not journal_dir.is_dir():
@@ -647,9 +705,13 @@ def find_latest_journal(target_folder: Path) -> Path | None:
             contents = read_journal(candidate)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
-        if not contents.undone and contents.moves:
+        if not contents.undone and contents.pending:
             return candidate
     return None
+
+
+# Skips a retry cannot fix: the moved file is gone or is another file now.
+_FINAL_SKIP_REASONS = frozenset({"missing", "changed"})
 
 
 @dataclass
@@ -660,56 +722,127 @@ class UndoResult:
     restored: list[tuple[Path, Path]] = field(default_factory=list)
     skipped: list[tuple[Path, str]] = field(default_factory=list)
 
+    @property
+    def retryable(self) -> list[tuple[Path, str]]:
+        """Skips that running undo again can still fix (conflicts, errors)."""
+        return [item for item in self.skipped if item[1] not in _FINAL_SKIP_REASONS]
+
 
 def undo_journal(journal_path: Path, *, dry_run: bool = False) -> UndoResult:
     """Move every recorded file back, newest move first.
 
-    A move is skipped when the organized file is gone (``missing``) or when
-    something now occupies the original path (``conflict``); nothing is ever
-    overwritten. Directories the run created are removed when empty, and the
-    journal is marked undone so it cannot be replayed twice.
+    Nothing is ever overwritten. A move is skipped when the organized file is
+    gone (``missing``), when it is no longer the file that was moved there
+    (``changed``: its size or mtime differ from the journal), or when
+    something now occupies the original path (``conflict``). Directories the
+    run created are removed when empty.
+
+    Each file moved back is journaled right away. The journal is marked
+    undone only when nothing is left that a retry could restore; after a
+    conflict or an I/O error it stays open, and undoing it again retries just
+    the moves that are left.
     """
     contents = read_journal(journal_path)
     if contents.undone:
         raise ValueError(f"journal already undone: {journal_path}")
     result = UndoResult(journal_path=journal_path)
-    for source, destination in reversed(contents.moves):
-        if not destination.exists():
-            result.skipped.append((destination, "missing"))
-            continue
-        if source.exists():
-            result.skipped.append((source, "conflict"))
-            continue
+    journal = None if dry_run else MoveJournal.reopen(journal_path)
+    try:
+        for entry in reversed(contents.pending):
+            skip = _undo_move(entry, dry_run=dry_run)
+            if skip is not None:
+                result.skipped.append(skip)
+                continue
+            result.restored.append((entry.destination, entry.source))
+            if journal is not None:
+                journal.record_restored(entry.id)
+
+        if journal is None:
+            return result
+
+        for directory in sorted(
+            set(contents.created_dirs), key=lambda item: len(item.parts), reverse=True
+        ):
+            try:
+                directory.rmdir()  # only succeeds when empty
+            except OSError:
+                continue
+        if not result.retryable:
+            journal.record_undone(
+                restored=len(result.restored), skipped=len(result.skipped)
+            )
+    finally:
+        if journal is not None:
+            journal.close()
+    return result
+
+
+def _undo_move(entry: JournalMove, *, dry_run: bool) -> tuple[Path, str] | None:
+    """Move one file back; returns ``(path, reason)`` when it is skipped."""
+    source, destination = entry.source, entry.destination
+    try:
+        info = os.lstat(destination)
+    except FileNotFoundError:
+        return destination, "missing"
+    except OSError as exc:
+        return destination, str(exc)
+
+    if os.path.lexists(source):
+        if not _is_leftover_duplicate(source, destination):
+            return source, "conflict"
+        # The move (or an earlier undo) stopped between creating the new
+        # name and deleting the old one: dropping the organized name is
+        # all that is left to do.
         if not dry_run:
             try:
-                source.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(destination), str(source))
+                os.unlink(destination)
             except OSError as exc:
-                result.skipped.append((destination, str(exc)))
-                continue
-        result.restored.append((destination, source))
+                return destination, str(exc)
+        return None
 
-    if dry_run:
-        return result
-
-    for directory in sorted(
-        set(contents.created_dirs), key=lambda item: len(item.parts), reverse=True
+    if (entry.size is not None and info.st_size != entry.size) or (
+        entry.mtime_ns is not None and info.st_mtime_ns != entry.mtime_ns
     ):
-        try:
-            directory.rmdir()  # only succeeds when empty
-        except OSError:
-            continue
-    with _open_journal(journal_path, "a") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "type": "undone",
-                    "at": datetime.now().isoformat(timespec="seconds"),
-                    "restored": len(result.restored),
-                    "skipped": len(result.skipped),
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
-    return result
+        return destination, "changed"
+    if dry_run:
+        return None
+
+    try:
+        source.parent.mkdir(parents=True, exist_ok=True)
+        _create_new(destination, source)
+    except FileExistsError:
+        return source, "conflict"
+    except OSError as exc:
+        return destination, str(exc)
+    try:
+        os.unlink(destination)
+    except OSError as exc:
+        with suppress(OSError):
+            os.unlink(source)
+        return destination, str(exc)
+    return None
+
+
+def _is_leftover_duplicate(source: Path, destination: Path) -> bool:
+    """Whether ``source`` is ``destination`` under a second name, or a copy.
+
+    Both must be regular files (never a symlink, which would point at the
+    file about to be removed), and either the same inode reached through two
+    hard links or byte-identical copies.
+    """
+    try:
+        src = os.lstat(source)
+        dst = os.lstat(destination)
+    except OSError:
+        return False
+    if not (stat.S_ISREG(src.st_mode) and stat.S_ISREG(dst.st_mode)):
+        return False
+    if (src.st_dev, src.st_ino) == (dst.st_dev, dst.st_ino):
+        # Two names for one file; with a single link they are one name.
+        return dst.st_nlink > 1
+    if src.st_size != dst.st_size:
+        return False
+    try:
+        return filecmp.cmp(source, destination, shallow=False)
+    except OSError:
+        return False
