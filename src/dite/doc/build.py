@@ -47,6 +47,15 @@ _CJK_PATTERN = re.compile(r"[一-鿿]")
 _HTML_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
 _HTML_TAG_PATTERN = re.compile(r"</?[A-Za-z][^>]*>")
 _MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_GLYPH_CODE_PATTERN = re.compile(r"(?:/G[0-9A-F]{2})+")
+_LETTER_OR_DIGIT_PATTERN = re.compile(r"[^\W_]")
+# A line holding nothing but a page number: "3", "- 3 -", "Page 3 of 10",
+# "p. 3", "3 / 10", "第 3 页", "第3页 共10页".
+_PAGE_NUMBER_LINE_PATTERN = re.compile(
+    r"[-–—\s]*(?:(?:page|pg|p)\.?\s*)?\d{1,4}(?:\s*(?:/|of)\s*\d{1,4})?[-–—\s]*"
+    r"|第\s*\d{1,4}\s*页(?:\s*[/,，]?\s*共\s*\d{1,4}\s*页)?",
+    re.IGNORECASE,
+)
 _LEADING_NUMBERING_PATTERN = re.compile(
     r"^(?:[0-9]+(?:\.[0-9]+)*[.、)]?|[ivxIVX]+[.、)]|[一二三四五六七八九十]+[、.])\s+"
 )
@@ -196,6 +205,37 @@ def strip_markup(text: str) -> str:
     return _HTML_TAG_PATTERN.sub(" ", cleaned)
 
 
+def meaningful_lines(text: str) -> list[str]:
+    """Return the lines of ``text`` that can carry document content.
+
+    Markup and extractor placeholders (``<!-- image -->``, page-break and
+    formula comments, Markdown images), PDF glyph codes, lines without a
+    letter or digit (rules, empty table rows) and bare page-number lines are
+    dropped; whitespace inside a line is collapsed. A scanned PDF that Docling
+    turned into ``<!-- image -->`` plus page numbers has no lines left.
+    """
+    cleaned = _GLYPH_CODE_PATTERN.sub(" ", strip_markup(text))
+    lines: list[str] = []
+    for raw_line in cleaned.splitlines():
+        line = " ".join(raw_line.split())
+        if not _LETTER_OR_DIGIT_PATTERN.search(line):
+            continue
+        if _PAGE_NUMBER_LINE_PATTERN.fullmatch(line):
+            continue
+        lines.append(line)
+    return lines
+
+
+def meaningful_text(text: str) -> str:
+    """Return the content of ``text`` without markup, placeholders or layout.
+
+    This is what quality flags and identical-content checks compare: two
+    copies of a document that differ only in placeholders, page numbers or
+    line wrapping give the same string.
+    """
+    return " ".join(meaningful_lines(text))
+
+
 def filename_title(stem: str) -> str:
     """Return the title-like form of a file stem (``a_b-c`` -> ``a b c``)."""
     return re.sub(r"[_-]+", " ", stem).strip()
@@ -301,7 +341,9 @@ def build_document_features(
     file_report=None,
 ) -> DocumentFeatures:
     """Build a conservative V2 feature object from current pipeline artifacts."""
-    stripped = content.strip()
+    # Quality is judged on what is left after placeholders and page numbers:
+    # ``<!-- image -->`` from a scan without OCR is not extracted text.
+    meaningful_length = len(meaningful_text(content))
     parent_tokens = []
     for part in file_path.parent.parts:
         parent_tokens.extend(_tokenize_text(part))
@@ -315,15 +357,16 @@ def build_document_features(
 
     quality_flags = QualityFlags(
         extraction_failed=(
-            (not primary_success) or len(stripped) < _FAILED_TEXT_THRESHOLD
+            (not primary_success) or meaningful_length < _FAILED_TEXT_THRESHOLD
         ),
-        short_text=len(stripped) < _SHORT_TEXT_THRESHOLD,
+        short_text=meaningful_length < _SHORT_TEXT_THRESHOLD,
         # Judged on the final text, not the primary extractor: a PDF rescued by
         # VLM fallback has real content even though the primary parse failed.
-        # The cut-off mirrors the embedding input rule, so this flag is true
-        # exactly when the document's vector was built from its file name.
+        # The cut-off mirrors the embedding input rule: the vector was built
+        # from the file name alone, or from the file name plus placeholders and
+        # page numbers. Either way it carries file-name evidence only.
         filename_dominant=(
-            len(stripped) <= FILENAME_FALLBACK_MAX_CHARS and bool(file_path.stem)
+            meaningful_length <= FILENAME_FALLBACK_MAX_CHARS and bool(file_path.stem)
         ),
     )
     title_candidates = _title_candidates(file_path, content)
