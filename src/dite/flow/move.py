@@ -514,7 +514,7 @@ def _move_file(op: FileOperation, journal: MoveJournal | None, taken: set[str]) 
             move_id = journal.record_move(op.source, op.destination)
     except BaseException:
         # The source is untouched, so a name made for it is only a duplicate.
-        new_name.discard(op.source)
+        new_name.discard()
         raise
     try:
         os.unlink(op.source)
@@ -550,45 +550,26 @@ def _lexists_or_none(path: Path) -> bool | None:
 
 @dataclass
 class _NewName:
-    """The name ``_create_unique`` is making, so an interrupt can undo it."""
+    """A name made for a file, so that an error or an interrupt can remove it.
+
+    ``created`` is set in the same ``_Uninterrupted`` step that makes the
+    name (see ``_link`` and ``_name_copy``), so it says whether the name at
+    ``path`` is ours without comparing inode numbers, which some file
+    systems (some Windows network drives) report as 0 for every file.
+    """
 
     path: Path | None = None
     created: bool = False
-    # (st_dev, st_ino) of the files _copy_new made for it.
-    copies: set[tuple[int, int]] = field(default_factory=set)
 
-    def discard(self, source: Path) -> None:
-        """Remove the name if it was made for ``source``.
-
-        An interrupt raised just as the name is made leaves ``created``
-        unset, but the name is then a hard link to ``source`` itself or one
-        of the copies made for it.
-        """
-        if self.path is None:
-            return
-        if (
-            self.created
-            or _same_inode(source, self.path)
-            or _identity(self.path) in self.copies
-        ):
-            with suppress(OSError):
-                os.unlink(self.path)
-
-
-def _identity(path: Path) -> tuple[int, int] | None:
-    try:
-        info = os.lstat(path)
-    except OSError:
-        return None
-    return info.st_dev, info.st_ino
-
-
-def _same_inode(first: Path, second: Path) -> bool:
-    try:
-        a, b = os.lstat(first), os.lstat(second)
-    except OSError:
-        return False
-    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+    def discard(self) -> None:
+        """Remove the name if it was made; never more than once."""
+        # A second Ctrl-C must not cut this short: the name would stay
+        # behind as a duplicate that no journal knows about.
+        with _Uninterrupted():
+            if self.created and self.path is not None:
+                self.created = False
+                with suppress(OSError):
+                    os.unlink(self.path)
 
 
 def _create_unique(
@@ -598,14 +579,11 @@ def _create_unique(
     candidate = destination
     counter = 1
     for _ in range(_MAX_RENAME_ATTEMPTS):
-        new_name.path, new_name.created = candidate, False
-        new_name.copies.clear()  # only files that exist for this attempt
         try:
-            _create_new(source, candidate, new_name.copies)
+            _create_new(source, candidate, new_name)
         except FileExistsError:
-            new_name.path = None  # someone else's file
+            pass  # someone else's file
         else:
-            new_name.created = True
             return candidate
         while True:
             candidate = destination.with_name(
@@ -618,9 +596,7 @@ def _create_unique(
     raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(destination))
 
 
-def _create_new(
-    source: Path, destination: Path, copies: set[tuple[int, int]] | None = None
-) -> None:
+def _create_new(source: Path, destination: Path, new_name: _NewName) -> None:
     """Give the content of ``source`` the new name ``destination``.
 
     Raises ``FileExistsError`` instead of replacing anything, judged by the
@@ -628,25 +604,33 @@ def _create_new(
     where possible: it is atomic and keeps the file as it is, inode and
     metadata included. Across file systems, on file systems without hard
     links (FAT, exFAT, some network shares) and for symlinks, whose target's
-    content is moved as before, the file is copied instead; the identity of
-    each file the copy makes is added to ``copies``.
+    content is moved as before, the file is copied instead. ``new_name``
+    records whether ``destination`` was made (see ``_NewName``).
     """
+    new_name.path, new_name.created = destination, False
     if not source.is_symlink():
         try:
-            os.link(source, destination)
+            _link(source, destination, new_name)
             return
         except FileExistsError:
             raise
         except OSError:
             pass
-    _copy_new(source, destination, set() if copies is None else copies)
+    _copy_new(source, destination, new_name)
+
+
+def _link(existing: Path, new: Path, new_name: _NewName) -> None:
+    """Hard-link ``existing`` as ``new``, recording the new name as made."""
+    with _Uninterrupted():  # the name and its record are made together
+        os.link(existing, new)
+        new_name.created = True
 
 
 _PARTIAL_PREFIX = ".dite-partial-"
 _PARTIAL_NAME = re.compile(re.escape(_PARTIAL_PREFIX) + "[0-9a-f]{32}")
 
 
-def _copy_new(source: Path, destination: Path, copies: set[tuple[int, int]]) -> None:
+def _copy_new(source: Path, destination: Path, new_name: _NewName) -> None:
     """Copy ``source`` to the new name ``destination``.
 
     The data goes to a hidden ``.dite-partial-<random>`` file next to
@@ -664,27 +648,24 @@ def _copy_new(source: Path, destination: Path, copies: set[tuple[int, int]]) -> 
         # A failed flush (a full disk) fails again in close(), which still
         # closes the file.
         with open(source, "rb") as fsrc, open(partial, "xb") as fdst:
-            copies.add(_fd_identity(fdst.fileno()))
             shutil.copyfileobj(fsrc, fdst)
             fdst.flush()
             os.fsync(fdst.fileno())
             if os.fstat(fdst.fileno()).st_size != os.fstat(fsrc.fileno()).st_size:
                 raise OSError(t("error_copy_failed"))
         shutil.copystat(source, partial)
-        _name_copy(partial, destination, copies)
+        _name_copy(partial, destination, new_name)
         # The new name must be on disk before the source can be deleted.
         _fsync_directory(destination.parent)
     except BaseException:
-        if _identity(destination) in copies:  # named just before the error
-            with suppress(OSError):
-                os.unlink(destination)
+        new_name.discard()  # named just before the error
         raise
     finally:
         with suppress(OSError):
             os.unlink(partial)  # the extra name; already gone after a rename
 
 
-def _name_copy(partial: Path, destination: Path, copies: set[tuple[int, int]]) -> None:
+def _name_copy(partial: Path, destination: Path, new_name: _NewName) -> None:
     """Give the finished copy ``partial`` the name ``destination``.
 
     Never replaces a file: a hard link fails when the name is taken. Where
@@ -692,27 +673,18 @@ def _name_copy(partial: Path, destination: Path, copies: set[tuple[int, int]]) -
     with O_EXCL, and the copy is renamed over that file of our own.
     """
     try:
-        os.link(partial, destination)
+        _link(partial, destination, new_name)
         return
     except FileExistsError:
         raise
     except OSError:
         pass  # FAT, exFAT, some network shares
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-    # Until its identity is known, an empty file left by an interrupt could
-    # not be told from someone else's.
-    with _Uninterrupted():
+    with _Uninterrupted():  # as in _link
         fd = os.open(destination, flags, 0o666)
-        try:
-            copies.add(_fd_identity(fd))
-        finally:
-            os.close(fd)
+        new_name.created = True
+        os.close(fd)
     os.replace(partial, destination)
-
-
-def _fd_identity(fd: int) -> tuple[int, int]:
-    info = os.fstat(fd)
-    return info.st_dev, info.st_ino
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -1182,9 +1154,10 @@ def _undo_move(entry: JournalMove, *, dry_run: bool) -> tuple[Path, str] | None:
     if dry_run:
         return None
 
+    new_name = _NewName()
     try:
         source.parent.mkdir(parents=True, exist_ok=True)
-        _create_new(destination, source)
+        _create_new(destination, source, new_name)
     except FileExistsError:
         return source, "conflict"
     except OSError as exc:
@@ -1198,8 +1171,7 @@ def _undo_move(entry: JournalMove, *, dry_run: bool) -> tuple[Path, str] | None:
         if destination_exists is False:
             return None  # deleted after all: the file is back
         if destination_exists:
-            with suppress(OSError):
-                os.unlink(source)
+            new_name.discard()
         return destination, str(exc)
     return None
 
@@ -1231,7 +1203,9 @@ def _is_leftover_duplicate(source: Path, destination: Path) -> bool:
 
     Both must be regular files (never a symlink, which would point at the
     file about to be removed), and either the same inode reached through two
-    hard links or byte-identical copies.
+    hard links or byte-identical copies. Where the file system reports no
+    inode numbers (0, as some Windows network drives do), only the content
+    can tell.
     """
     try:
         src = os.lstat(source)
@@ -1240,7 +1214,7 @@ def _is_leftover_duplicate(source: Path, destination: Path) -> bool:
         return False
     if not (stat.S_ISREG(src.st_mode) and stat.S_ISREG(dst.st_mode)):
         return False
-    if (src.st_dev, src.st_ino) == (dst.st_dev, dst.st_ino):
+    if src.st_ino and (src.st_dev, src.st_ino) == (dst.st_dev, dst.st_ino):
         # Two names for one file; with a single link they are one name.
         return dst.st_nlink > 1
     if src.st_size != dst.st_size:

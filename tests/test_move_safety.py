@@ -466,7 +466,7 @@ def test_ctrl_c_before_the_journal_write_leaves_no_unrecorded_name(
 
     def link_then_interrupt(*args, **kwargs):
         real_link(*args, **kwargs)
-        raise KeyboardInterrupt  # pending SIGINT, raised as link returns
+        signal.raise_signal(signal.SIGINT)  # Ctrl-C as the link is made
 
     monkeypatch.setattr(os, "link", link_then_interrupt)
 
@@ -477,6 +477,10 @@ def test_ctrl_c_before_the_journal_write_leaves_no_unrecorded_name(
     assert source.read_text(encoding="utf-8") == "payload"
     assert _organized_files(preview.target_folder) == []
     assert read_journal(preview.journal_path).pending == []
+
+
+def _no_link(*_args, **_kwargs):  # FAT, exFAT
+    raise PermissionError(errno.EPERM, "Operation not permitted")
 
 
 def _ctrl_c_on_journal_fsync(monkeypatch, journal_dir: Path, record: int) -> None:
@@ -521,6 +525,87 @@ def test_ctrl_c_as_a_folder_is_journaled_leaves_no_unrecorded_folder(
     assert [path.name for path in target.iterdir()] == [JOURNAL_DIR_NAME]
     assert first.read_text(encoding="utf-8") == "a"
     assert second.read_text(encoding="utf-8") == "b"
+
+
+@pytest.mark.parametrize("hard_links", [True, False], ids=["link", "copy"])
+def test_ctrl_c_again_during_the_cleanup_still_removes_the_new_name(
+    tmp_path: Path, monkeypatch, hard_links: bool
+) -> None:
+    source = _write(tmp_path / "src" / "a.txt", "payload")
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", [source])
+    new_name = preview.operations[0].destination
+    real_unlink = os.unlink
+
+    def interrupted(*_args, **_kwargs):
+        raise KeyboardInterrupt  # the first Ctrl-C, once the name is made
+
+    def unlink(path, *args, **kwargs):
+        if os.fspath(path) == os.fspath(new_name):
+            signal.raise_signal(signal.SIGINT)  # pressed again, and again
+        return real_unlink(path, *args, **kwargs)
+
+    if hard_links:
+        monkeypatch.setattr(move_module.MoveJournal, "record_move", interrupted)
+    else:
+        monkeypatch.setattr(os, "link", _no_link)
+        monkeypatch.setattr(move_module, "_fsync_directory", interrupted)
+    monkeypatch.setattr(os, "unlink", unlink)
+
+    with pytest.raises(KeyboardInterrupt):
+        _execute(preview)
+    monkeypatch.undo()
+
+    assert source.read_text(encoding="utf-8") == "payload"
+    assert _organized_files(preview.target_folder) == []
+
+
+class _WithoutInodeNumber:
+    """``os.lstat`` of a file system that reports st_ino 0 for every file."""
+
+    def __init__(self, info: os.stat_result) -> None:
+        self._info = info
+
+    def __getattr__(self, name: str):
+        return 0 if name == "st_ino" else getattr(self._info, name)
+
+
+def _without_inode_numbers(monkeypatch) -> None:
+    real_lstat = os.lstat
+
+    def lstat(*args, **kwargs):
+        return _WithoutInodeNumber(real_lstat(*args, **kwargs))
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+
+def test_ctrl_c_never_removes_a_file_it_did_not_make_without_inode_numbers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = _write(tmp_path / "src" / "a.txt", "payload")
+    preview = OrganizePreview(
+        source_folder=tmp_path / "src", target_folder=tmp_path / "out"
+    )
+    preview.add_cluster("Topic", [source])
+    planned = preview.operations[0].destination
+    real_link = os.link
+
+    def someone_else_then_ctrl_c(src, dst, *args, **kwargs):
+        _write(Path(dst), "someone else's file")  # appears just before the link
+        signal.raise_signal(signal.SIGINT)
+        return real_link(src, dst, *args, **kwargs)
+
+    _without_inode_numbers(monkeypatch)
+    monkeypatch.setattr(os, "link", someone_else_then_ctrl_c)
+
+    with pytest.raises(KeyboardInterrupt):
+        _execute(preview)
+    monkeypatch.undo()
+
+    assert planned.read_text(encoding="utf-8") == "someone else's file"
+    assert source.read_text(encoding="utf-8") == "payload"
 
 
 class _NearlyFullFile(io.FileIO):
@@ -1024,6 +1109,23 @@ def test_undo_retry_finds_a_file_moved_back_before_its_record(
     assert read_journal(preview.journal_path).undone is True
     assert not (preview.target_folder / "Topic").exists()
     assert files[0].read_text(encoding="utf-8") == "payload 0"
+
+
+def test_undo_compares_content_where_inode_numbers_are_missing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    preview, files = _organize(tmp_path, ["a.txt"])
+    moved = preview.operations[0].destination
+    os.link(moved, tmp_path / "backup.txt")  # a second name for the moved file
+    files[0].write_text("another file", encoding="utf-8")
+    _without_inode_numbers(monkeypatch)
+
+    result = undo_journal(preview.journal_path)
+    monkeypatch.undo()
+
+    assert result.skipped == [(files[0], "conflict")]
+    assert moved.read_text(encoding="utf-8") == "payload 0"
+    assert files[0].read_text(encoding="utf-8") == "another file"
 
 
 def test_undo_skips_files_replaced_after_the_move(tmp_path: Path) -> None:
