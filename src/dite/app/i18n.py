@@ -291,6 +291,7 @@ class Messages:
     debug_analyzer_api_failed: str
     warning_unsupported_file_format: str
     warning_extractor_failed: str
+    warning_extract_file_failed: str
     warning_pdf2image_missing: str
     warning_vlm_fallback_failed: str
     warning_analyzer_default_used: str
@@ -679,6 +680,7 @@ ZH_CN = Messages(
     debug_analyzer_api_failed="API 调用失败 (尝试 {attempt}/{max_retries}): {error}",
     warning_unsupported_file_format="不支持的文件格式: {suffix}",
     warning_extractor_failed="{extractor} 处理 {name} 失败: {error}",
+    warning_extract_file_failed="提取 {path} 失败，继续处理其他文件: {error}",
     warning_pdf2image_missing="pdf2image 未安装，无法使用 VLM 回退",
     warning_vlm_fallback_failed="VLM 回退处理失败: {error}",
     warning_analyzer_default_used="文档分析失败，使用默认值",
@@ -1129,6 +1131,9 @@ EN = Messages(
     ),
     warning_unsupported_file_format="Unsupported file format: {suffix}",
     warning_extractor_failed="{extractor} failed on {name}: {error}",
+    warning_extract_file_failed=(
+        "Extraction failed for {path}; continuing with the other files: {error}"
+    ),
     warning_pdf2image_missing="pdf2image is not installed, cannot use VLM fallback",
     warning_vlm_fallback_failed="VLM fallback failed: {error}",
     warning_analyzer_default_used="Document analysis failed, using defaults",

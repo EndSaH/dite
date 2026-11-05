@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import hashlib
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+
+from rich.markup import escape
 
 from dite.app.i18n import t
 from dite.cache import VLM_CACHE_VERSION
@@ -43,6 +47,58 @@ def merge_summary_delta(
     summary.source_fallback_needed += delta.source_fallback_needed
     summary.selected_vlm_files += delta.selected_vlm_files
     summary.vlm_api_page_calls += delta.vlm_api_page_calls
+
+
+# Longest exception text kept in a failed file's report; library errors can
+# carry whole payloads.
+_FAILURE_MESSAGE_LIMIT = 200
+
+
+def _unreadable_file_hash(file: Path) -> str:
+    """Stand-in hash for a file that could not be read.
+
+    Derived from the path, so each unreadable file stays its own canonical
+    sample and never matches a real content hash in the caches.
+    """
+    return "unreadable:" + hashlib.sha256(os.fsencode(file)).hexdigest()
+
+
+def _failed_work_result(
+    item: ExtractionWorkItem,
+    error: Exception,
+    logger,
+) -> ExtractionWorkResult:
+    """Record a file whose extraction raised, so the rest of the run goes on."""
+    message = f"{type(error).__name__}: {error}"
+    if len(message) > _FAILURE_MESSAGE_LIMIT:
+        message = message[:_FAILURE_MESSAGE_LIMIT] + "..."
+    logger.warning(
+        t(
+            "warning_extract_file_failed",
+            path=escape(str(item.file)),
+            error=escape(message),
+        )
+    )
+    return ExtractionWorkResult(
+        index=item.index,
+        content="",
+        file_hash=item.file_hash,
+        report=ExtractionFileReport(
+            file=item.file,
+            primary_extractor="none",
+            primary_success=False,
+            primary_error=message,
+            source_profile=None,
+            source_effective_length=0,
+            selected_source="primary",
+            final_effective_length=0,
+            excerpt_was_truncated=False,
+            vlm_api_page_calls=0,
+            sample_page_limit=None,
+            file_hash=item.file_hash,
+        ),
+        summary_delta=ExtractionSummaryDelta(primary_failures=1),
+    )
 
 
 def extract_content_work_item(
@@ -244,7 +300,15 @@ def extract_stage(
     work_results: list[ExtractionWorkResult | None] = [None] * len(files)
     summary = ExtractionSummary()
     truncate_limit = config.processing.text_truncate_limit
-    file_hashes = [compute_file_hash(file) for file in files]
+    hash_errors: dict[int, Exception] = {}
+    for index, file in enumerate(files):
+        try:
+            file_hashes[index] = compute_file_hash(file)
+        except Exception as exc:
+            # Deleted after the scan, no read permission, a cloud placeholder:
+            # only this file fails.
+            file_hashes[index] = _unreadable_file_hash(file)
+            hash_errors[index] = exc
     hash_to_indices: dict[str, list[int]] = {}
     for index, file_hash in enumerate(file_hashes):
         hash_to_indices.setdefault(file_hash, []).append(index)
@@ -262,6 +326,14 @@ def extract_stage(
     ]
 
     def run_item(item: ExtractionWorkItem) -> ExtractionWorkResult:
+        if item.index in hash_errors:
+            return _failed_work_result(item, hash_errors[item.index], logger)
+        try:
+            return extract_item(item)
+        except Exception as exc:
+            return _failed_work_result(item, exc, logger)
+
+    def extract_item(item: ExtractionWorkItem) -> ExtractionWorkResult:
         if work_item_runner is not None:
             return work_item_runner(
                 item,
