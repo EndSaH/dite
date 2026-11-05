@@ -954,8 +954,12 @@ def test_undo_skips_files_replaced_after_the_move(tmp_path: Path) -> None:
     assert not any(path.exists() for path in files)
     assert replaced.read_text(encoding="utf-8") == "a different file"
     assert touched.read_text(encoding="utf-8") == "payload X"
-    # A retry cannot fix this, so the journal does not stay open for it.
-    assert read_journal(preview.journal_path).undone is True
+    # Not marked undone, but undoing the target passes over it: nothing in
+    # it can be moved back now.
+    assert read_journal(preview.journal_path).undone is False
+    passed_over: list[Path] = []
+    assert find_latest_journal(preview.target_folder, passed_over=passed_over) is None
+    assert passed_over == [preview.journal_path]
 
 
 def test_undo_still_reads_journals_without_file_identity(tmp_path: Path) -> None:
@@ -1028,7 +1032,7 @@ def test_cli_undo_reports_partial_undo_and_retries(tmp_path: Path, monkeypatch) 
     assert read_journal(preview.journal_path).undone is True
 
 
-def test_cli_undo_closes_a_journal_once_only_final_skips_remain(
+def test_cli_undo_writes_nothing_when_nothing_can_be_moved_back(
     tmp_path: Path, monkeypatch
 ) -> None:
     _write_cli_config(tmp_path, monkeypatch)
@@ -1037,16 +1041,18 @@ def test_cli_undo_closes_a_journal_once_only_final_skips_remain(
     assert len(undo_journal(preview.journal_path).restored) == 1
     # The user keeps the new b.txt and deletes the organized one instead.
     preview.operations[1].destination.unlink()
+    before = preview.journal_path.read_bytes()
 
     result = CliRunner().invoke(app, ["undo", str(preview.target_folder), "--yes"])
 
     assert result.exit_code == 0, result.output
-    assert read_journal(preview.journal_path).undone is True
+    assert "0 restored" in result.output
+    assert preview.journal_path.read_bytes() == before
     assert find_latest_journal(preview.target_folder) is None
     assert files[1].read_text(encoding="utf-8") == "placeholder"
 
 
-def test_cli_undo_moves_nothing_back_when_closing_a_journal(
+def test_cli_undo_moves_nothing_back_without_confirmation(
     tmp_path: Path, monkeypatch
 ) -> None:
     _write_cli_config(tmp_path, monkeypatch)
@@ -1072,4 +1078,64 @@ def test_cli_undo_moves_nothing_back_when_closing_a_journal(
     assert result.exit_code == 0, result.output
     assert moved.read_text(encoding="utf-8") == "payload 0"
     assert not files[0].exists()
+    assert read_journal(preview.journal_path).undone is False
+
+
+def test_cli_undo_finds_a_journal_again_once_its_files_are_back(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _write_cli_config(tmp_path, monkeypatch)
+    preview, files = _organize(tmp_path, ["a.txt", "b.txt"])
+    folder = preview.target_folder / "Topic"
+    renamed = folder.with_name("My topic")
+    folder.rename(renamed)  # the user renames the folder dite made
+    runner = CliRunner()
+
+    # No --yes: nothing can be moved back, so nothing is asked or written.
+    first = runner.invoke(app, ["undo", str(preview.target_folder)])
+
+    assert first.exit_code == 0, first.output
+    assert "0 restored" in first.output
+    assert not any(path.exists() for path in files)
+    assert read_journal(preview.journal_path).undone is False
+
+    renamed.rename(folder)
+    second = runner.invoke(app, ["undo", str(preview.target_folder), "--yes"])
+
+    assert second.exit_code == 0, second.output
+    for index, path in enumerate(files):
+        assert path.read_text(encoding="utf-8") == f"payload {index}"
     assert read_journal(preview.journal_path).undone is True
+
+
+def test_cli_undo_passes_over_a_run_whose_files_are_gone_for_now(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _write_cli_config(tmp_path, monkeypatch)
+    target = tmp_path / "out"
+    first_file = _write(tmp_path / "src" / "a.txt", "first run")
+    second_file = _write(tmp_path / "src" / "b.txt", "second run")
+    runs = []
+    for folder, path in (("One", first_file), ("Two", second_file)):
+        preview = OrganizePreview(source_folder=tmp_path / "src", target_folder=target)
+        preview.add_cluster(folder, [path])
+        assert _execute(preview) == (1, 0)
+        runs.append(preview)
+    (target / "Two").rename(target / "Elsewhere")
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["undo", str(target), "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert first_file.read_text(encoding="utf-8") == "first run"
+    assert not second_file.exists()
+    # The user is told which run was passed over (rich may wrap anywhere).
+    assert runs[1].journal_path.name in "".join(result.output.split())
+    assert read_journal(runs[1].journal_path).undone is False
+
+    (target / "Elsewhere").rename(target / "Two")
+    again = runner.invoke(app, ["undo", str(target), "--yes"])
+
+    assert again.exit_code == 0, again.output
+    assert second_file.read_text(encoding="utf-8") == "second run"
+    assert find_latest_journal(target) is None

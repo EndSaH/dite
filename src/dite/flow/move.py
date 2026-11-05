@@ -1003,12 +1003,18 @@ def read_journal(path: Path) -> JournalContents:
     )
 
 
-def find_latest_journal(target_folder: Path) -> Path | None:
+def find_latest_journal(
+    target_folder: Path, *, passed_over: list[Path] | None = None
+) -> Path | None:
     """Return the newest journal under ``target/.dite`` with moves to undo.
 
     Journals that are already undone, or that have no move left to undo
     (every copy failed, or a partial undo already moved everything back),
-    are skipped.
+    are skipped. So is a journal none of whose remaining moves can be undone
+    right now, because the organized files are missing or were changed; it
+    is only read, never marked, so it is found again once its files are back
+    (a renamed folder renamed back, a drive plugged in again). Such journals
+    are appended to ``passed_over``, newest first.
     """
     journal_dir = Path(target_folder) / JOURNAL_DIR_NAME
     if not journal_dir.is_dir():
@@ -1021,13 +1027,28 @@ def find_latest_journal(target_folder: Path) -> Path | None:
             contents = read_journal(candidate)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
-        if not contents.undone and contents.pending:
+        if contents.undone or not contents.pending:
+            continue
+        if _has_undo_work(contents):
             return candidate
+        if passed_over is not None:
+            passed_over.append(candidate)
     return None
 
 
-# Skips a retry cannot fix: the moved file is gone or is another file now.
-_FINAL_SKIP_REASONS = frozenset({"missing", "changed"})
+def _has_undo_work(contents: JournalContents) -> bool:
+    """Whether undo could move a file back now, or has a skip to retry."""
+    for entry in contents.pending:
+        skip = _undo_move(entry, dry_run=True)
+        if skip is None or skip[1] not in _ABSENT_SKIP_REASONS:
+            return True
+    return False
+
+
+# Skips with nothing for the user to fix at the original location: the moved
+# file is not there, or is not the file that was moved. Undo cannot do
+# anything about them unless the file comes back.
+_ABSENT_SKIP_REASONS = frozenset({"missing", "changed"})
 
 
 @dataclass
@@ -1041,7 +1062,7 @@ class UndoResult:
     @property
     def retryable(self) -> list[tuple[Path, str]]:
         """Skips that running undo again can still fix (conflicts, errors)."""
-        return [item for item in self.skipped if item[1] not in _FINAL_SKIP_REASONS]
+        return [item for item in self.skipped if item[1] not in _ABSENT_SKIP_REASONS]
 
 
 def undo_journal(journal_path: Path, *, dry_run: bool = False) -> UndoResult:
@@ -1053,12 +1074,11 @@ def undo_journal(journal_path: Path, *, dry_run: bool = False) -> UndoResult:
     something now occupies the original path (``conflict``). Directories the
     run created are removed when empty.
 
-    Each file moved back is journaled right away. The journal is marked
-    undone only when nothing is left that a retry could restore; after a
-    conflict or an I/O error it stays open, and undoing it again retries just
-    the moves that are left. Partial copies that a killed organize or undo
-    left next to these files are removed. SIGTERM and SIGHUP stop the run
-    the way Ctrl-C does.
+    Each file moved back is journaled right away, and the journal is marked
+    undone only once every move is undone: after any skip it stays open, and
+    undoing it again retries just the moves that are left. Partial copies
+    that a killed organize or undo left next to these files are removed.
+    SIGTERM and SIGHUP stop the run the way Ctrl-C does.
     """
     if dry_run:
         return _undo_journal(journal_path, dry_run=True)
@@ -1097,7 +1117,7 @@ def _undo_journal(journal_path: Path, *, dry_run: bool) -> UndoResult:
                 directory.rmdir()  # only succeeds when empty
             except OSError:
                 continue
-        if not result.retryable:
+        if not result.skipped:
             journal.record_undone(
                 restored=len(result.restored), skipped=len(result.skipped)
             )
@@ -1105,20 +1125,6 @@ def _undo_journal(journal_path: Path, *, dry_run: bool) -> UndoResult:
         if journal is not None:
             journal.close()
     return result
-
-
-def close_journal(journal_path: Path, *, skipped: int) -> None:
-    """Mark a journal undone without touching any file or directory.
-
-    For a journal whose remaining moves can no longer be undone (all
-    ``missing`` or ``changed``), so that undoing the target goes on to the
-    run before it without moving anything the user has not confirmed.
-    """
-    journal = MoveJournal.reopen(journal_path)
-    try:
-        journal.record_undone(restored=0, skipped=skipped)
-    finally:
-        journal.close()
 
 
 def _undo_move(entry: JournalMove, *, dry_run: bool) -> tuple[Path, str] | None:

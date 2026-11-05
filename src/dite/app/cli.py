@@ -1036,15 +1036,17 @@ def undo(
     """Undo the file moves recorded by organize/assign --execute."""
     from rich.markup import escape
 
-    from dite.flow.move import (
-        close_journal,
-        find_latest_journal,
-        read_journal,
-        undo_journal,
-    )
+    from dite.flow.move import find_latest_journal, read_journal, undo_journal
 
     logger = get_logger()
-    journal_path = path if path.is_file() else find_latest_journal(path)
+    passed_over: list[Path] = []
+    if path.is_file():
+        journal_path = path
+    else:
+        journal_path = find_latest_journal(path, passed_over=passed_over)
+        if journal_path is None and passed_over:
+            # Nothing can be undone right now: show why for the latest run.
+            journal_path, passed_over = passed_over[0], []
     if journal_path is None:
         logger.error(t("undo_no_journal", path=escape(str(path))))
         raise typer.Exit(1)
@@ -1059,6 +1061,8 @@ def undo(
     if contents.undone:
         logger.error(t("undo_already_done", path=escape(str(journal_path))))
         raise typer.Exit(1)
+    for other in passed_over:
+        logger.warning(t("undo_passed_over", path=escape(str(other))))
 
     plan = undo_journal(journal_path, dry_run=True)
     logger.print(
@@ -1076,11 +1080,8 @@ def undo(
     if dry_run:
         return
     if not plan.restored:
-        if not plan.retryable:
-            # Nothing a retry could move back: close the journal so the next
-            # `dite undo` goes on to the run before this one. Nothing was
-            # confirmed, so no file is touched.
-            close_journal(journal_path, skipped=len(plan.skipped))
+        # Nothing was confirmed, so nothing is moved or written: the journal
+        # stays as it is, and is found again once its files are back.
         logger.success(t("undo_done", restored=0, skipped=len(plan.skipped)))
         _print_undo_retry_hint(logger, plan, path)
         return
