@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import shlex
 import shutil
 import unicodedata
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -59,6 +62,10 @@ def _name_key(name: str) -> str:
     return unicodedata.normalize("NFC", name).casefold()
 
 
+def _path_key(path: Path) -> str:
+    return _name_key(os.fspath(path))
+
+
 @dataclass
 class FileOperation:
     """文件操作"""
@@ -84,6 +91,12 @@ class OrganizePreview:
     journal_path: Path | None = None  # 最近一次 execute 写入的移动记录
     # _name_key() of every folder name in cluster_map.
     _folder_keys: set[str] = field(default_factory=set, init=False, repr=False)
+    # _path_key() of every planned destination.
+    _planned_keys: set[str] = field(default_factory=set, init=False, repr=False)
+    # directory -> _name_key() of the names already in it, listed once.
+    _existing_names: dict[Path, set[str]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     @staticmethod
     def _sanitize_cluster_name(cluster_name: str) -> str:
@@ -105,18 +118,39 @@ class OrganizePreview:
         return name[:80]
 
     def _unique_destination(self, destination: Path) -> Path:
-        """为目标路径分配唯一文件名，避免覆盖。"""
-        existing_destinations = {op.destination for op in self.operations}
+        """为目标路径分配唯一文件名，避免覆盖。
+
+        Names are compared the way case-insensitive volumes (the macOS
+        default) compare them, against the other planned destinations and
+        against what is already in the folder: ``README.md`` and
+        ``readme.md`` are one file there. ``execute`` checks again, because
+        the folder can change between the preview and the move.
+        """
+        existing = self._names_in(destination.parent)
         candidate = destination
         counter = 1
 
-        while candidate in existing_destinations or candidate.exists():
+        while (
+            _path_key(candidate) in self._planned_keys
+            or _name_key(candidate.name) in existing
+        ):
             candidate = destination.with_name(
                 f"{destination.stem}_{counter}{destination.suffix}"
             )
             counter += 1
 
+        self._planned_keys.add(_path_key(candidate))
         return candidate
+
+    def _names_in(self, directory: Path) -> set[str]:
+        names = self._existing_names.get(directory)
+        if names is None:
+            try:
+                names = {_name_key(name) for name in os.listdir(directory)}
+            except OSError:
+                names = set()  # not created yet, or unreadable
+            self._existing_names[directory] = names
+        return names
 
     def add_cluster(self, cluster_name: str, files: list[Path]) -> None:
         """添加一个簇的文件
@@ -237,6 +271,17 @@ class OrganizePreview:
             "",
             "set -e  # Stop on error",
             "",
+            # cp silently replaces a file that is already there (one that
+            # appeared after the preview, say), so stop before each copy.
+            "ensure_absent() {",
+            '  if [ -e "$1" ] || [ -L "$1" ]; then',
+            "    printf '%s %s\\n' "
+            + shell_quote(t("organize_script_exists"))
+            + ' "$1" >&2',
+            "    exit 1",
+            "  fi",
+            "}",
+            "",
             f"# {t('organize_script_create_dirs')}",
         ]
 
@@ -250,6 +295,7 @@ class OrganizePreview:
 
         # 复制命令
         for op in self.operations:
+            lines.append(f"ensure_absent {shell_quote(op.destination)}")
             lines.append(
                 f"cp -p -- {shell_quote(op.source)} {shell_quote(op.destination)}"
             )
@@ -284,6 +330,13 @@ class OrganizePreview:
 
         Returns:
             (成功数, 失败数)
+
+        Nothing that exists is ever replaced: a destination that is taken
+        by the time the file is moved (or that the file system treats as the
+        same name) gets the next free ``_N`` name, and ``op.destination`` and
+        the journal hold the name actually used. Each move is journaled
+        before its source is deleted, and a failed move leaves no copy
+        behind. A full or read-only target stops the remaining moves.
         """
         if dry_run:
             return len(self.operations), 0
@@ -313,8 +366,18 @@ class OrganizePreview:
                     for directory in created:
                         journal.record_mkdir(directory)
 
+            # Every planned name, so a late rename cannot take another
+            # operation's destination.
+            taken = {_path_key(op.destination) for op in self.operations}
+            abort_error: str | None = None
+
             # 执行操作
             for op in self.operations:
+                if abort_error is not None:
+                    op.status = "failed"
+                    op.error = abort_error
+                    failed += 1
+                    continue
                 try:
                     created = _missing_ancestors(op.destination.parent)
                     op.destination.parent.mkdir(parents=True, exist_ok=True)
@@ -322,29 +385,16 @@ class OrganizePreview:
                         for directory in created:
                             journal.record_mkdir(directory)
 
-                    # 先复制
-                    shutil.copy2(op.source, op.destination)
-
-                    # 验证复制成功
-                    if (
-                        op.destination.exists()
-                        and op.destination.stat().st_size == op.source.stat().st_size
-                    ):
-                        op.source.unlink()  # 删除原文件
-                        op.status = "success"
-                        success += 1
-                        if journal is not None:
-                            journal.record_move(op.source, op.destination)
-                    else:
-                        op.destination.unlink()  # 删除不完整的副本
-                        op.status = "failed"
-                        op.error = t("error_copy_failed")
-                        failed += 1
+                    _move_file(op, journal, taken)
+                    op.status = "success"
+                    success += 1
 
                 except Exception as e:
                     op.status = "failed"
                     op.error = str(e)
                     failed += 1
+                    if isinstance(e, OSError) and e.errno in _ABORT_ERRNOS:
+                        abort_error = str(e)
         finally:
             if journal is not None:
                 journal.close()
@@ -356,6 +406,100 @@ JOURNAL_DIR_NAME = ".dite"
 JOURNAL_VERSION = 1
 _JOURNAL_PREFIX = "organize-"
 _JOURNAL_SUFFIX = ".jsonl"
+
+# Errors after which every remaining move would fail the same way.
+_ABORT_ERRNOS = frozenset(
+    code
+    for code in (errno.ENOSPC, errno.EROFS, getattr(errno, "EDQUOT", None))
+    if code is not None
+)
+_MAX_RENAME_ATTEMPTS = 10_000
+
+
+def _move_file(op: FileOperation, journal: MoveJournal | None, taken: set[str]) -> None:
+    """Move ``op.source`` to ``op.destination`` (or the next free name).
+
+    The new name is created first and journaled, and only then is the source
+    deleted, so an interruption leaves at worst a second name for a file the
+    journal knows about, never a moved file that undo cannot find. When the
+    source cannot be deleted the new name is removed again.
+    """
+    op.destination = _create_unique(op.source, op.destination, taken)
+    move_id: int | None = None
+    try:
+        if journal is not None:
+            move_id = journal.record_move(op.source, op.destination)
+        os.unlink(op.source)
+    except BaseException:
+        try:
+            os.unlink(op.destination)
+        except OSError:
+            pass  # both names stay; undo drops the recorded duplicate
+        else:
+            if journal is not None and move_id is not None:
+                with suppress(OSError):
+                    journal.record_cancel(move_id)
+        raise
+
+
+def _create_unique(source: Path, destination: Path, taken: set[str]) -> Path:
+    """Create ``destination`` (or ``stem_N.ext``) as a new name for ``source``."""
+    candidate = destination
+    counter = 1
+    for _ in range(_MAX_RENAME_ATTEMPTS):
+        try:
+            _create_new(source, candidate)
+            return candidate
+        except FileExistsError:
+            pass
+        while True:
+            candidate = destination.with_name(
+                f"{destination.stem}_{counter}{destination.suffix}"
+            )
+            counter += 1
+            if _path_key(candidate) not in taken:
+                taken.add(_path_key(candidate))
+                break
+    raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(destination))
+
+
+def _create_new(source: Path, destination: Path) -> None:
+    """Give the content of ``source`` the new name ``destination``.
+
+    Raises ``FileExistsError`` instead of replacing anything, judged by the
+    file system itself (so case-insensitively on APFS). A hard link is used
+    where possible: it is atomic and keeps the file as it is, inode and
+    metadata included. Across file systems, on file systems without hard
+    links (FAT, exFAT, some network shares) and for symlinks, whose target's
+    content is moved as before, the file is copied instead.
+    """
+    if not source.is_symlink():
+        try:
+            os.link(source, destination)
+            return
+        except FileExistsError:
+            raise
+        except OSError:
+            pass
+    _copy_new(source, destination)
+
+
+def _copy_new(source: Path, destination: Path) -> None:
+    """Copy ``source`` to a newly created ``destination``, removed on failure."""
+    # "x" never truncates an existing file; it raises FileExistsError.
+    with open(source, "rb") as fsrc, open(destination, "xb") as fdst:
+        try:
+            shutil.copyfileobj(fsrc, fdst)
+            fdst.flush()
+            os.fsync(fdst.fileno())
+            if os.fstat(fdst.fileno()).st_size != os.fstat(fsrc.fileno()).st_size:
+                raise OSError(t("error_copy_failed"))
+            shutil.copystat(source, destination)
+        except BaseException:
+            fdst.close()
+            with suppress(OSError):
+                os.unlink(destination)
+            raise
 
 
 def _missing_ancestors(directory: Path) -> list[Path]:
@@ -381,6 +525,7 @@ class MoveJournal:
     def __init__(self, path: Path, handle) -> None:
         self.path = path
         self._handle = handle
+        self._next_move_id = 0
 
     @classmethod
     def create(
@@ -408,18 +553,29 @@ class MoveJournal:
     def _write(self, record: dict[str, Any]) -> None:
         self._handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         self._handle.flush()
+        # On disk before the change it vouches for (deleting the source).
+        os.fsync(self._handle.fileno())
 
     def record_mkdir(self, directory: Path) -> None:
         self._write({"type": "mkdir", "path": str(Path(directory).resolve())})
 
-    def record_move(self, source: Path, destination: Path) -> None:
+    def record_move(self, source: Path, destination: Path) -> int:
+        """Record a move before its source is deleted; returns its id."""
+        move_id = self._next_move_id
+        self._next_move_id += 1
         self._write(
             {
                 "type": "move",
+                "id": move_id,
                 "source": str(Path(source).absolute()),
                 "destination": str(Path(destination).resolve()),
             }
         )
+        return move_id
+
+    def record_cancel(self, move_id: int) -> None:
+        """The move was rolled back because its source could not be deleted."""
+        self._write({"type": "cancel", "id": move_id})
 
     def close(self) -> None:
         self._handle.close()
@@ -439,7 +595,8 @@ class JournalContents:
 def read_journal(path: Path) -> JournalContents:
     """Load a move journal written by ``OrganizePreview.execute``."""
     header: dict[str, Any] = {}
-    moves: list[tuple[Path, Path]] = []
+    moves: dict[int, tuple[Path, Path]] = {}
+    move_count = 0
     created_dirs: list[Path] = []
     undone = False
     with _open_journal(path, "r") as handle:
@@ -452,7 +609,12 @@ def read_journal(path: Path) -> JournalContents:
             if kind == "header":
                 header = record
             elif kind == "move":
-                moves.append((Path(record["source"]), Path(record["destination"])))
+                # Older journals have no ids: a move's id is its position.
+                move_id = record.get("id", move_count)
+                move_count += 1
+                moves[move_id] = (Path(record["source"]), Path(record["destination"]))
+            elif kind == "cancel":
+                moves.pop(record.get("id"), None)
             elif kind == "mkdir":
                 created_dirs.append(Path(record["path"]))
             elif kind == "undone":
@@ -462,7 +624,7 @@ def read_journal(path: Path) -> JournalContents:
     return JournalContents(
         path=path,
         header=header,
-        moves=moves,
+        moves=list(moves.values()),
         created_dirs=created_dirs,
         undone=undone,
     )

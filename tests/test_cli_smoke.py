@@ -613,14 +613,19 @@ def test_organize_preview_execute_handles_partial_copy_failure(
 
     import shutil
 
-    real_copy2 = shutil.copy2
+    real_copyfileobj = shutil.copyfileobj
 
-    def flaky_copy2(src, dst, *args, **kwargs):
-        if Path(src).name == "bad.txt":
+    def cross_device_link(*_args, **_kwargs):
+        raise OSError(18, "Invalid cross-device link")
+
+    def flaky_copyfileobj(fsrc, fdst, *args, **kwargs):
+        if Path(fsrc.name).name == "bad.txt":
             raise OSError("disk full")
-        return real_copy2(src, dst, *args, **kwargs)
+        return real_copyfileobj(fsrc, fdst, *args, **kwargs)
 
-    monkeypatch.setattr("dite.flow.move.shutil.copy2", flaky_copy2)
+    # Force the copy path a move across file systems takes.
+    monkeypatch.setattr("dite.flow.move.os.link", cross_device_link)
+    monkeypatch.setattr("dite.flow.move.shutil.copyfileobj", flaky_copyfileobj)
 
     success, failed = preview.execute(dry_run=False)
 

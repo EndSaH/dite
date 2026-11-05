@@ -148,6 +148,7 @@ class Messages:
     organize_script_usage: str
     organize_script_create_dirs: str
     organize_script_copy_files: str
+    organize_script_exists: str
     organize_script_verify: str
     organize_script_done: str
     organize_script_warning: str
@@ -482,6 +483,7 @@ ZH_CN = Messages(
     organize_script_usage="使用方法:",
     organize_script_create_dirs="创建目录",
     organize_script_copy_files="复制文件（使用 cp + rm 而非 mv，更安全）",
+    organize_script_exists="目标位置已有文件，为避免覆盖已停止:",
     organize_script_verify="验证复制成功后删除原文件",
     organize_script_done="✅ 完成！共复制 {count} 个文件",
     organize_script_warning="⚠️  原文件未删除，请手动确认后执行删除",
@@ -922,6 +924,7 @@ EN = Messages(
     organize_script_usage="Usage:",
     organize_script_create_dirs="Create directories",
     organize_script_copy_files="Copy files (using cp + rm instead of mv for safety)",
+    organize_script_exists="Stopped, so as not to overwrite an existing file:",
     organize_script_verify="Delete original files after verification",
     organize_script_done="✅ Done! Copied {count} files",
     organize_script_warning=(
