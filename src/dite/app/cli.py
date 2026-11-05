@@ -1094,6 +1094,10 @@ def undo(
 
     try:
         result = undo_journal(journal_path)
+    except KeyboardInterrupt:
+        # Typer would end the run without a word.
+        logger.error(t("undo_interrupted", target=escape(str(path))))
+        raise typer.Exit(130) from None
     except OSError as exc:
         logger.error(
             t(

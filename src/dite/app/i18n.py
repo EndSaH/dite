@@ -134,6 +134,7 @@ class Messages:
     undo_partial: str
     undo_passed_over: str
     undo_stopped: str
+    undo_interrupted: str
     undo_skipped_missing: str
     undo_skipped_conflict: str
     undo_skipped_changed: str
@@ -468,6 +469,9 @@ ZH_CN = Messages(
     undo_stopped=(
         "撤销已中止：无法写入记录 {path}（{error}）。已经移回的文件保持不动；"
         "解决问题（例如腾出磁盘空间）后再次运行 dite undo {target} 即可继续"
+    ),
+    undo_interrupted=(
+        "撤销已中断。已经移回的文件保持不动；再次运行 dite undo {target} 即可接着做完"
     ),
     undo_skipped_missing="跳过（整理后的文件已不存在）: {path}",
     undo_skipped_conflict="跳过（原位置已有同名文件）: {path}",
@@ -921,6 +925,10 @@ EN = Messages(
         "Undo stopped: could not write to the journal {path} ({error}). Files "
         "moved back so far stay back; fix the problem (free up disk space, "
         "say) and run dite undo {target} again to continue"
+    ),
+    undo_interrupted=(
+        "Undo interrupted. Files moved back so far stay back; run dite undo "
+        "{target} again to finish"
     ),
     undo_skipped_missing="Skipped (the moved file no longer exists): {path}",
     undo_skipped_conflict=(

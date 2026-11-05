@@ -54,28 +54,44 @@ def finalize_organize_run(
 
     if execute:
         logger.print("\n")
-        confirm = __import__("typer").confirm(t("organize_confirm"))
+        typer = __import__("typer")
+        confirm = typer.confirm(t("organize_confirm"))
         if confirm:
-            from dite.flow.move import JOURNAL_DIR_NAME
+            from dite.flow.move import JOURNAL_DIR_NAME, find_latest_journal
 
-            success, failed = preview.execute(
-                dry_run=False,
-                journal_dir=preview.target_folder / JOURNAL_DIR_NAME,
-            )
+            try:
+                success, failed = preview.execute(
+                    dry_run=False,
+                    journal_dir=preview.target_folder / JOURNAL_DIR_NAME,
+                )
+            except KeyboardInterrupt:
+                # Typer would end the run without a word: say how to undo
+                # what was moved (or the folders made) before the interrupt.
+                logger.error(t("error_interrupted"))
+                journal_path = getattr(preview, "journal_path", None)
+                if journal_path is not None and journal_path == find_latest_journal(
+                    preview.target_folder
+                ):
+                    _print_journal_written(logger, preview, journal_path)
+                raise typer.Exit(130) from None
             logger.success(t("organize_done", success=success, failed=failed))
             journal_path = getattr(preview, "journal_path", None)
             if journal_path is not None and success:
-                from rich.markup import escape
-
-                logger.print(
-                    t(
-                        "organize_journal_written",
-                        path=escape(str(journal_path)),
-                        target=escape(str(preview.target_folder)),
-                    )
-                )
+                _print_journal_written(logger, preview, journal_path)
         else:
             logger.print(t("organize_cancelled"))
         return
 
     logger.print(f"\n[dim]{t('organize_dry_run_hint')}[/dim]")
+
+
+def _print_journal_written(logger, preview, journal_path) -> None:
+    from rich.markup import escape
+
+    logger.print(
+        t(
+            "organize_journal_written",
+            path=escape(str(journal_path)),
+            target=escape(str(preview.target_folder)),
+        )
+    )

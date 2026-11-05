@@ -19,6 +19,7 @@ import unicodedata
 from pathlib import Path
 
 import pytest
+import typer
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -1495,6 +1496,72 @@ def test_cli_undo_removes_the_folders_of_a_run_stopped_before_its_first_move(
     assert first.read_text(encoding="utf-8") == "a"
     assert second.read_text(encoding="utf-8") == "b"
     assert runner.invoke(app, ["undo", str(target)]).exit_code == 1  # all done
+
+
+def test_ctrl_c_during_execute_says_how_to_undo_the_moves_made(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from dite.app.i18n import set_locale
+    from dite.report.move import finalize_organize_run
+    from dite.util.log import Logger
+
+    set_locale("en")
+    files = [_write(tmp_path / "src" / name, name) for name in ("a.txt", "b.txt")]
+    target = tmp_path / "out"
+    preview = OrganizePreview(source_folder=tmp_path / "src", target_folder=target)
+    preview.add_cluster("Topic", files)
+    logger = Logger()
+    logger.console = Console(file=io.StringIO(), width=500)
+    real_record_move = move_module.MoveJournal.record_move
+
+    def record_move(self, source, destination):
+        if source == files[1]:
+            signal.raise_signal(signal.SIGINT)  # Ctrl-C on the second file
+        return real_record_move(self, source, destination)
+
+    monkeypatch.setattr("typer.confirm", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(move_module.MoveJournal, "record_move", record_move)
+
+    with pytest.raises(typer.Exit) as stopped:
+        try:
+            finalize_organize_run(
+                preview=preview, logger=logger, output_script=None, execute=True
+            )
+        except KeyboardInterrupt:
+            pytest.fail("the interrupt ended the run without a word")
+
+    assert stopped.value.exit_code == 130
+    output = logger.console.file.getvalue()
+    assert "Interrupted" in output
+    assert f"dite undo {target}" in output
+    assert preview.journal_path.name in output
+    assert not files[0].exists()
+
+
+def test_cli_ctrl_c_during_undo_says_how_to_finish_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _write_cli_config(tmp_path, monkeypatch)
+    preview, files = _organize(tmp_path, ["a.txt", "b.txt"])
+    runner = CliRunner()
+    with monkeypatch.context() as patch:
+        _ctrl_c_on_journal_fsync(patch, preview.journal_path.parent, 1)
+
+        result = runner.invoke(
+            app, ["undo", str(preview.target_folder), "--yes"], env={"COLUMNS": "500"}
+        )
+
+    assert result.exit_code == 130
+    assert "Undo interrupted" in result.output
+    assert f"dite undo {preview.target_folder} again" in result.output
+    assert files[1].read_text(encoding="utf-8") == "payload 1"
+
+    retry = runner.invoke(app, ["undo", str(preview.target_folder), "--yes"])
+
+    assert retry.exit_code == 0, retry.output
+    assert read_journal(preview.journal_path).undone is True
+    for index, path in enumerate(files):
+        assert path.read_text(encoding="utf-8") == f"payload {index}"
 
 
 def test_cli_undo_finishes_an_undo_stopped_after_its_last_file(
