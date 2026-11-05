@@ -1080,13 +1080,15 @@ def undo(
     _print_undo_skips(logger, plan.skipped, sources)
     if dry_run:
         return
-    if not plan.restored:
+    if plan.skipped and not plan.restored:
         # Nothing was confirmed, so nothing is moved or written: the journal
         # stays as it is, and is found again once its files are back.
         logger.success(t("undo_done", restored=0, skipped=len(plan.skipped)))
         _print_undo_retry_hint(logger, plan, path)
         return
-    if not yes and not typer.confirm(t("undo_confirm")):
+    # With nothing left at all, an earlier undo stopped after moving every
+    # file back: finishing it moves nothing, so there is nothing to confirm.
+    if plan.restored and not yes and not typer.confirm(t("undo_confirm")):
         logger.print(t("organize_cancelled"))
         return
 

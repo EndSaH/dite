@@ -896,11 +896,21 @@ class MoveJournal:
 
     def record_cancel(self, move_id: int) -> None:
         """The move was rolled back because its source could not be deleted."""
-        self._write({"type": "cancel", "id": move_id})
+        self._write_done({"type": "cancel", "id": move_id})
 
     def record_restored(self, move_id: int) -> None:
         """Undo moved this file back; a retried undo leaves it alone."""
-        self._write({"type": "restored", "id": move_id})
+        self._write_done({"type": "restored", "id": move_id})
+
+    def _write_done(self, record: dict[str, Any]) -> None:
+        """Write a record of a change that is already made.
+
+        An interrupt waits until the record is written: ``_write`` would
+        otherwise cut it off, and a retried undo would look for the file
+        where it no longer is.
+        """
+        with _Uninterrupted():
+            self._write(record)
 
     def record_undone(self, *, restored: int, skipped: int) -> None:
         self._write(
@@ -1008,13 +1018,14 @@ def find_latest_journal(
 ) -> Path | None:
     """Return the newest journal under ``target/.dite`` with moves to undo.
 
-    Journals that are already undone, or that have no move left to undo
-    (every copy failed, or a partial undo already moved everything back),
-    are skipped. So is a journal none of whose remaining moves can be undone
-    right now, because the organized files are missing or were changed; it
-    is only read, never marked, so it is found again once its files are back
-    (a renamed folder renamed back, a drive plugged in again). Such journals
-    are appended to ``passed_over``, newest first.
+    Journals that are already undone, or that recorded no move (every copy
+    failed), are skipped. So is a journal none of whose remaining moves can
+    be undone right now, because the organized files are missing or were
+    changed; it is only read, never marked, so it is found again once its
+    files are back (a renamed folder renamed back, a drive plugged in
+    again). Such journals are appended to ``passed_over``, newest first. An
+    undo that stopped after moving every file back is found too, so that a
+    retry removes the run's folders and marks the journal undone.
     """
     journal_dir = Path(target_folder) / JOURNAL_DIR_NAME
     if not journal_dir.is_dir():
@@ -1027,7 +1038,7 @@ def find_latest_journal(
             contents = read_journal(candidate)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
-        if contents.undone or not contents.pending:
+        if contents.undone or not contents.entries:
             continue
         if _has_undo_work(contents):
             return candidate
@@ -1037,7 +1048,13 @@ def find_latest_journal(
 
 
 def _has_undo_work(contents: JournalContents) -> bool:
-    """Whether undo could move a file back now, or has a skip to retry."""
+    """Whether undo could move a file back now or has a skip to retry.
+
+    With nothing pending, an undo stopped after moving every file back, and
+    only its cleanup is left.
+    """
+    if not contents.pending:
+        return True
     for entry in contents.pending:
         skip = _undo_move(entry, dry_run=True)
         if skip is None or skip[1] not in _ABSENT_SKIP_REASONS:
@@ -1076,9 +1093,11 @@ def undo_journal(journal_path: Path, *, dry_run: bool = False) -> UndoResult:
 
     Each file moved back is journaled right away, and the journal is marked
     undone only once every move is undone: after any skip it stays open, and
-    undoing it again retries just the moves that are left. Partial copies
-    that a killed organize or undo left next to these files are removed.
-    SIGTERM and SIGHUP stop the run the way Ctrl-C does.
+    undoing it again retries just the moves that are left. A file that an
+    interrupted undo moved back without journaling it is recognized by its
+    size and mtime (see ``_already_back``). Partial copies that a killed
+    organize or undo left next to these files are removed. SIGTERM and
+    SIGHUP stop the run the way Ctrl-C does.
     """
     if dry_run:
         return _undo_journal(journal_path, dry_run=True)
@@ -1133,6 +1152,8 @@ def _undo_move(entry: JournalMove, *, dry_run: bool) -> tuple[Path, str] | None:
     try:
         info = os.lstat(destination)
     except FileNotFoundError:
+        if _already_back(entry):
+            return None  # only the record of the move back is missing
         return destination, "missing"
     except OSError as exc:
         return destination, str(exc)
@@ -1177,6 +1198,28 @@ def _undo_move(entry: JournalMove, *, dry_run: bool) -> tuple[Path, str] | None:
                 os.unlink(source)
         return destination, str(exc)
     return None
+
+
+def _already_back(entry: JournalMove) -> bool:
+    """Whether the moved file is at its original path, although not journaled.
+
+    An undo stopped between moving a file back and journaling that (by an
+    interrupt or a full disk), or a move rolled back without its ``cancel``
+    record, leaves the organized name gone and the file at its source. It is
+    told by the size and mtime the journal has for it; journals without
+    them still report the file missing.
+    """
+    if entry.size is None or entry.mtime_ns is None:
+        return False
+    try:
+        info = os.lstat(entry.source)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_size == entry.size
+        and info.st_mtime_ns == entry.mtime_ns
+    )
 
 
 def _is_leftover_duplicate(source: Path, destination: Path) -> bool:

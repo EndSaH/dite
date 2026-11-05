@@ -479,6 +479,23 @@ def test_ctrl_c_before_the_journal_write_leaves_no_unrecorded_name(
     assert read_journal(preview.journal_path).pending == []
 
 
+def _ctrl_c_on_journal_fsync(monkeypatch, journal_dir: Path, record: int) -> None:
+    """Press Ctrl-C while the ``record``-th journal record from now is fsynced."""
+    real_fsync = os.fsync
+    count = 0
+
+    def fsync(fd):
+        nonlocal count
+        real_fsync(fd)
+        info = os.fstat(fd)
+        if any(os.path.samestat(info, os.stat(j)) for j in journal_dir.glob("*.jsonl")):
+            count += 1
+            if count == record:
+                signal.raise_signal(signal.SIGINT)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+
+
 class _NearlyFullFile(io.FileIO):
     """A file on a disk with ``room`` bytes left; writing more raises ENOSPC."""
 
@@ -934,6 +951,54 @@ def test_undo_keeps_the_restored_file_when_a_delete_error_comes_late(
     assert result.skipped == []
 
 
+@pytest.mark.parametrize("record", [1, 3], ids=["first", "last"])
+def test_ctrl_c_while_a_restore_is_journaled_can_be_retried(
+    tmp_path: Path, monkeypatch, record: int
+) -> None:
+    preview, files = _organize(tmp_path, ["a.txt", "b.txt", "c.txt"])
+    _ctrl_c_on_journal_fsync(monkeypatch, preview.journal_path.parent, record)
+
+    with pytest.raises(KeyboardInterrupt):
+        undo_journal(preview.journal_path)
+    monkeypatch.undo()
+
+    # The file is back already, so its record is kept.
+    assert len(read_journal(preview.journal_path).restored_ids) == record
+    assert find_latest_journal(preview.target_folder) == preview.journal_path
+
+    retry = undo_journal(preview.journal_path)
+
+    assert retry.skipped == []
+    assert read_journal(preview.journal_path).undone is True
+    assert not (preview.target_folder / "Topic").exists()
+    for index, path in enumerate(files):
+        assert path.read_text(encoding="utf-8") == f"payload {index}"
+
+
+def test_undo_retry_finds_a_file_moved_back_before_its_record(
+    tmp_path: Path, monkeypatch
+) -> None:
+    preview, files = _organize(tmp_path, ["a.txt", "b.txt"])
+
+    def interrupted(self, move_id):
+        raise KeyboardInterrupt  # Ctrl-C between the move back and its record
+
+    monkeypatch.setattr(move_module.MoveJournal, "record_restored", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        undo_journal(preview.journal_path)
+    monkeypatch.undo()
+    assert files[1].read_text(encoding="utf-8") == "payload 1"
+    assert read_journal(preview.journal_path).restored_ids == set()
+
+    retry = undo_journal(find_latest_journal(preview.target_folder))
+
+    assert retry.skipped == []
+    assert sorted(source for _, source in retry.restored) == files
+    assert read_journal(preview.journal_path).undone is True
+    assert not (preview.target_folder / "Topic").exists()
+    assert files[0].read_text(encoding="utf-8") == "payload 0"
+
+
 def test_undo_skips_files_replaced_after_the_move(tmp_path: Path) -> None:
     preview, files = _organize(tmp_path, ["a.txt", "b.txt"])
     replaced, touched = (op.destination for op in preview.operations)
@@ -962,9 +1027,10 @@ def test_undo_skips_files_replaced_after_the_move(tmp_path: Path) -> None:
     assert passed_over == [preview.journal_path]
 
 
-def test_undo_still_reads_journals_without_file_identity(tmp_path: Path) -> None:
+def _write_journal_without_file_identity(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A journal as older versions wrote it: no ids, sizes or mtimes."""
     source = tmp_path / "src" / "a.txt"
-    moved = _write(tmp_path / "out" / "Topic" / "a.txt", "payload")
+    moved = tmp_path / "out" / "Topic" / "a.txt"
     journal = tmp_path / "out" / JOURNAL_DIR_NAME / "organize-20250101-000000-0.jsonl"
     journal.parent.mkdir(parents=True)
     journal.write_text(
@@ -980,6 +1046,12 @@ def test_undo_still_reads_journals_without_file_identity(tmp_path: Path) -> None
         ),
         encoding="utf-8",
     )
+    return journal, source, moved
+
+
+def test_undo_still_reads_journals_without_file_identity(tmp_path: Path) -> None:
+    journal, source, moved = _write_journal_without_file_identity(tmp_path)
+    _write(moved, "payload")
 
     assert find_latest_journal(tmp_path / "out") == journal
     result = undo_journal(journal)
@@ -988,6 +1060,19 @@ def test_undo_still_reads_journals_without_file_identity(tmp_path: Path) -> None
     assert source.read_text(encoding="utf-8") == "payload"
     assert not (tmp_path / "out" / "Topic").exists()
     assert read_journal(journal).undone is True
+
+
+def test_undo_without_file_identity_cannot_tell_a_file_is_back(
+    tmp_path: Path,
+) -> None:
+    journal, source, moved = _write_journal_without_file_identity(tmp_path)
+    _write(source, "payload")  # back at its source, or a new file there
+
+    result = undo_journal(journal)
+
+    assert result.skipped == [(moved, "missing")]
+    assert read_journal(journal).undone is False
+    assert source.read_text(encoding="utf-8") == "payload"
 
 
 def _write_cli_config(tmp_path: Path, monkeypatch) -> None:
@@ -1163,12 +1248,46 @@ def test_cli_undo_stops_with_a_clear_message_when_the_journal_cannot_be_written(
     def disk_full(self, move_id):
         raise OSError(errno.ENOSPC, "No space left on device")
 
-    monkeypatch.setattr(move_module.MoveJournal, "record_restored", disk_full)
+    runner = CliRunner()
+    with monkeypatch.context() as patch:
+        patch.setattr(move_module.MoveJournal, "record_restored", disk_full)
 
-    result = CliRunner().invoke(app, ["undo", str(preview.target_folder), "--yes"])
+        result = runner.invoke(app, ["undo", str(preview.target_folder), "--yes"])
 
     assert result.exit_code == 1
     assert not isinstance(result.exception, OSError)
     assert "Undo stopped" in result.output
     # The one file moved back before the error stays back.
     assert files[1].read_text(encoding="utf-8") == "payload 1"
+
+    # Once there is room again, running undo again finishes the job: the
+    # file moved back without a record is not taken for a missing one.
+    retry = runner.invoke(app, ["undo", str(preview.target_folder), "--yes"])
+
+    assert retry.exit_code == 0, retry.output
+    assert "Skipped" not in retry.output
+    assert read_journal(preview.journal_path).undone is True
+    assert not (preview.target_folder / "Topic").exists()
+    for index, path in enumerate(files):
+        assert path.read_text(encoding="utf-8") == f"payload {index}"
+
+
+def test_cli_undo_finishes_an_undo_stopped_after_its_last_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _write_cli_config(tmp_path, monkeypatch)
+    preview, files = _organize(tmp_path, ["a.txt", "b.txt"])
+    with monkeypatch.context() as patch:
+        _ctrl_c_on_journal_fsync(patch, preview.journal_path.parent, 2)
+        with pytest.raises(KeyboardInterrupt):
+            undo_journal(preview.journal_path)
+    assert read_journal(preview.journal_path).pending == []
+
+    # No --yes and no answer: nothing is left to move, so nothing is asked.
+    result = CliRunner().invoke(app, ["undo", str(preview.target_folder)])
+
+    assert result.exit_code == 0, result.output
+    assert read_journal(preview.journal_path).undone is True
+    assert not (preview.target_folder / "Topic").exists()
+    for index, path in enumerate(files):
+        assert path.read_text(encoding="utf-8") == f"payload {index}"
