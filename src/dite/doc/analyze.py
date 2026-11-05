@@ -233,9 +233,10 @@ def analyze_document(
                 max_tokens=500,
             )
 
-            response_text = (
-                strip_reasoning_text(response.choices[0].message.content) or "{}"
-            )
+            raw_reply = response.choices[0].message.content
+            # A reply that is blank once reasoning is removed fails to parse,
+            # so it is retried and reported like any other unusable answer.
+            response_text = strip_reasoning_text(raw_reply) if raw_reply else "{}"
 
             # 尝试解析 JSON
             data = json.loads(response_text)

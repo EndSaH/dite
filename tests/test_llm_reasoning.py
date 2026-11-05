@@ -62,6 +62,7 @@ class _ReplyClient:
         *,
         base_url: str = "http://localhost:8000/v1",
         error: Exception | None = None,
+        finish_reason: str = "stop",
     ) -> None:
         self.base_url = base_url
         self.calls: list[dict] = []
@@ -84,7 +85,7 @@ class _ReplyClient:
                 class _Choice:
                     def __init__(self, text: str) -> None:
                         self.message = _Message(text)
-                        self.finish_reason = "length"
+                        self.finish_reason = finish_reason
 
                 class _Response:
                     model = "dummy-model"
@@ -216,6 +217,30 @@ def test_analyze_document_strips_reasoning_before_json_parsing() -> None:
     assert analysis.content.topic == "finance"
     assert analysis.content.keywords == ["profit"]
     assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "<think>\nLet me analyze this document. The topic seems",
+        "<think>\nThe document is about profit.\n</think>",
+        "   ",
+    ],
+)
+def test_analyze_document_retries_and_warns_when_reply_has_no_answer(
+    reply: str, capsys
+) -> None:
+    from dite.doc.analyze import analyze_document
+
+    client = _ReplyClient(reply, finish_reason="length")
+
+    analysis = analyze_document(
+        client, "Quarterly profit", config=Config(), max_retries=2
+    )
+
+    assert analysis.content.topic == ""
+    assert len(client.calls) == 2
+    assert "Document analysis failed, using defaults" in _flat(capsys.readouterr().out)
 
 
 # --- cluster-name validation ----------------------------------------------
