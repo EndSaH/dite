@@ -244,6 +244,8 @@
 
 只清除 VLM 回退缓存，同时保留主提取内容和其他缓存行。
 
+带 VLM 内容的文件（以及与它哈希相同的文件）的 embedding 是基于 VLM 文本算出的，会一并失效；其他文件的 embedding 保持不变。命令会分别报告清除的 VLM 条目数和失效的 embedding 数。
+
 ## `dite setup docling-pdf`
 
 安装 DITE 所需的本地 Docling PDF 模型文件。

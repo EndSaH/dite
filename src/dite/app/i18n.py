@@ -478,7 +478,10 @@ ZH_CN = Messages(
     organize_script_warning="⚠️  原文件未删除，请手动确认后执行删除",
     # Cache commands
     cache_cleared="已清除 {count} 条缓存记录",
-    cache_vlm_cleared="已清除 {count} 条 VLM 缓存（文档转换结果已保留）",
+    cache_vlm_cleared=(
+        "已清除 {count} 条 VLM 缓存，并使 {embeddings} 条基于它的 Embedding 失效"
+        "（文档转换结果和其他 Embedding 已保留）"
+    ),
     cache_status_title="缓存状态",
     cache_db_path="数据库路径:",
     cache_total_entries="总条目数:",
@@ -892,7 +895,8 @@ EN = Messages(
     # Cache commands
     cache_cleared="Cleared {count} cache entries",
     cache_vlm_cleared=(
-        "Cleared {count} VLM cache entries (document conversion results preserved)"
+        "Cleared {count} VLM cache entries and invalidated {embeddings} embeddings "
+        "built on them (document conversion results and other embeddings preserved)"
     ),
     cache_status_title="Cache Status",
     cache_db_path="Database path:",

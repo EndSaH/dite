@@ -630,12 +630,16 @@ def test_cache_clear_vlm_cli_clears_only_vlm_entries(
         content_md="doc-a",
         vlm_content="vlm-a",
         vlm_version=2,
+        embedding=np.array([1.0, 2.0], dtype=np.float32),
+        model_version="embed-v1",
     )
     cache.save(
         file_path=file_b,
         file_hash="hash-b",
         file_mtime=1.0,
         content_md="doc-b",
+        embedding=np.array([3.0, 4.0], dtype=np.float32),
+        model_version="embed-v1",
     )
     cache.close()
 
@@ -643,6 +647,8 @@ def test_cache_clear_vlm_cli_clears_only_vlm_entries(
     result = runner.invoke(app, ["cache", "clear-vlm"])
 
     assert result.exit_code == 0
+    assert "Cleared 1 VLM cache entries" in result.output
+    assert "invalidated 1 embeddings" in result.output
 
     cache = FileCache(cache_dir=tmp_path / "cache")
     assert cache.get_vlm_content(file_a, "hash-a", required_version=2) is None
@@ -653,6 +659,8 @@ def test_cache_clear_vlm_cli_clears_only_vlm_entries(
     assert entry_b is not None
     assert entry_a.content_md == "doc-a"
     assert entry_b.content_md == "doc-b"
+    assert entry_a.embedding is None
+    assert entry_b.embedding is not None
     cache.close()
 
 

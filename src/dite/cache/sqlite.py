@@ -33,6 +33,14 @@ class CacheEntry:
     created_at: str
 
 
+@dataclass(frozen=True)
+class VlmCacheClearResult:
+    """clear_vlm_cache 的结果"""
+
+    vlm_entries: int  # 清除了 VLM 内容的条目数
+    embeddings: int  # 因此失效的 embedding 条目数
+
+
 class FileCache:
     """
     文件缓存管理器
@@ -554,30 +562,42 @@ class FileCache:
 
         return count
 
-    def clear_vlm_cache(self) -> int:
+    def clear_vlm_cache(self) -> VlmCacheClearResult:
         """
         仅清除 VLM 缓存（保留 docling 结果）
 
+        只有带 VLM 内容的文件，其 embedding 可能是基于 VLM 文本算出的，
+        所以只让这些文件哈希下的 embedding 失效；按哈希而不是按行处理，
+        是因为同哈希的其他路径会复用这份 VLM 内容和 embedding。
+        其他文件的 embedding 保持不变。
+
         Returns:
-            更新的条目数
+            清除的 VLM 条目数与失效的 embedding 条目数
         """
         conn = self._get_conn()
         cursor = conn.execute(
-            "SELECT COUNT(*) FROM file_cache WHERE vlm_content IS NOT NULL"
+            """
+            UPDATE file_cache
+            SET embedding = NULL
+            WHERE embedding IS NOT NULL
+              AND file_hash IN (
+                  SELECT file_hash FROM file_cache WHERE vlm_content IS NOT NULL
+              )
+            """
         )
-        count = cursor.fetchone()[0]
-
-        conn.execute(
+        embeddings = cursor.rowcount
+        cursor = conn.execute(
             """
             UPDATE file_cache
             SET vlm_content = NULL,
-                vlm_version = NULL,
-                embedding = NULL
+                vlm_version = NULL
+            WHERE vlm_content IS NOT NULL
             """
         )
+        vlm_entries = cursor.rowcount
         conn.commit()
 
-        return count
+        return VlmCacheClearResult(vlm_entries=vlm_entries, embeddings=embeddings)
 
     def get_stats(
         self, required_embedding_version: str | None = None

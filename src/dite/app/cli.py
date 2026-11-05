@@ -1110,10 +1110,16 @@ def cache_clear_vlm(ctx: typer.Context):
         max_size_gb=config.cache.max_size_gb,
     )
 
-    count = cache.clear_vlm_cache()
+    result = cache.clear_vlm_cache()
     cache.close()
 
-    logger.success(t("cache_vlm_cleared", count=count))
+    logger.success(
+        t(
+            "cache_vlm_cleared",
+            count=result.vlm_entries,
+            embeddings=result.embeddings,
+        )
+    )
 
 
 @cache_app.command("status", help=_help_key("cli_help_cache_status"))

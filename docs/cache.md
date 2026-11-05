@@ -205,17 +205,20 @@ embedding 版本不是单个固定常量，而是由两部分拼起来的：
 
 - 最终内容可能已经变了，之前的 embedding 不再可靠。
 
-### 清空 VLM 缓存时也会让 embedding 失效
+### 清空 VLM 缓存时也会让依赖它的 embedding 失效
 
-当前 `clear_vlm_cache()` 会把这些字段全部置空：
+当前 `clear_vlm_cache()` 只处理带 VLM 内容的条目：
 
-- `vlm_content = NULL`
-- `vlm_version = NULL`
-- `embedding = NULL`
+- 这些条目的 `vlm_content` 和 `vlm_version` 被置空。
+- 与这些条目文件哈希相同的所有行，`embedding` 被置空。
+- 其他文件的 `embedding` 和所有 `content_md` 保持不变。
 
 原因是：
 
 - 一旦 VLM 最终内容被清掉，基于它构建的 embedding 也就不再可信。
+- 按哈希失效，是因为同哈希的其他路径会复用这份 VLM 内容，它们的 embedding 同样基于 VLM 文本。
+
+`dite cache clear-vlm` 会分别报告清除的 VLM 条目数和失效的 embedding 数。
 
 ### Embedding 版本不匹配时会被当成 miss
 

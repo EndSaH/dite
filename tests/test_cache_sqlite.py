@@ -392,3 +392,58 @@ def test_file_cache_uses_distinct_connections_per_thread_and_closes_all(
         except sqlite3.ProgrammingError:
             continue
         raise AssertionError("connection should be closed by FileCache.close()")
+
+
+def test_clear_vlm_cache_only_invalidates_embeddings_built_on_vlm(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "cache.db"
+    docx = tmp_path / "plain.docx"
+    pdf = tmp_path / "scanned.pdf"
+    pdf_copy = tmp_path / "scanned copy.pdf"
+
+    cache = FileCache(db_path=db_path)
+    cache.save(
+        file_path=docx,
+        file_hash="hash-docx",
+        file_mtime=1.0,
+        content_md="docx content",
+        embedding=np.array([1.0, 2.0], dtype=np.float32),
+        model_version="embed-v1",
+    )
+    cache.save(
+        file_path=pdf,
+        file_hash="hash-pdf",
+        file_mtime=1.0,
+        content_md="pdf docling content",
+        vlm_content="pdf vlm content",
+        vlm_version=2,
+        embedding=np.array([3.0, 4.0], dtype=np.float32),
+        model_version="embed-v1",
+    )
+    # A duplicate of the PDF reuses its VLM text through the hash lookup, so
+    # its embedding is built on VLM content although its own row has none.
+    cache.update_embedding(
+        file_path=pdf_copy,
+        file_hash="hash-pdf",
+        embedding=np.array([3.0, 4.0], dtype=np.float32),
+        model_version="embed-v1",
+    )
+
+    result = cache.clear_vlm_cache()
+
+    docx_embedding = cache.get_embedding(docx, "hash-docx", "embed-v1")
+    assert docx_embedding is not None
+    assert docx_embedding.tolist() == [1.0, 2.0]
+    assert cache.get_embedding(pdf, "hash-pdf", "embed-v1") is None
+    assert cache.get_embedding(pdf_copy, "hash-pdf", "embed-v1") is None
+    assert result.vlm_entries == 1
+    assert result.embeddings == 2
+    assert cache.get_vlm_content(pdf, "hash-pdf", required_version=2) is None
+    assert cache.get_content(pdf, "hash-pdf") == ("pdf docling content", None)
+    assert cache.get_content(docx, "hash-docx") == ("docx content", None)
+
+    stats = cache.get_stats()
+    assert stats["with_embedding"] == 1
+    assert stats["with_vlm"] == 0
+    cache.close()
