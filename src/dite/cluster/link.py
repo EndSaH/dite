@@ -9,9 +9,30 @@ import numpy as np
 
 from dite.cluster.model import CandidateComponent, CandidateEdge
 from dite.doc import DocumentFeatures
-from dite.doc.build import filename_title, is_generic_title
+from dite.doc.build import filename_title, is_generic_title, meaningful_lines
 
 _SIMILARITY_BLOCK_ROWS = 1024
+# Identical content forces a ``must_link``, so it must be more than a shared
+# scanner footer or cover line. Counted over distinct cleaned lines, so a
+# footer repeated on every page counts once.
+NEAR_DUPLICATE_MIN_CHARS = 200
+
+
+def _duplicate_key(feature: DocumentFeatures) -> str:
+    """Return the cleaned content compared for identical-content edges.
+
+    Placeholders, page numbers and layout are ignored, so two copies of a
+    document still match when one has an extra ``<!-- image -->`` or different
+    line wrapping. Returns ``""`` (never a duplicate) when too little content
+    is left: two scans that Docling turned into ``<!-- image -->`` share that
+    text whatever they show.
+    """
+    if feature.quality_flags.filename_dominant:
+        return ""
+    lines = meaningful_lines(feature.content_text)
+    if sum(len(line) for line in dict.fromkeys(lines)) < NEAR_DUPLICATE_MIN_CHARS:
+        return ""
+    return " ".join(lines)
 
 
 def _content_title_keys(feature: DocumentFeatures) -> set[str]:
@@ -118,7 +139,7 @@ def _candidate_pairs(
     *,
     token_sets: list[set[str]],
     title_sets: list[set[str]],
-    stripped_contents: list[str],
+    duplicate_keys: list[str],
     min_filename_token_overlap: float,
     min_content_similarity: float,
 ) -> list[tuple[int, int]]:
@@ -145,8 +166,8 @@ def _candidate_pairs(
     by_content: dict[object, list[int]] = defaultdict(list)
     by_title: dict[object, list[int]] = defaultdict(list)
     for index in range(count):
-        if stripped_contents[index]:
-            by_content[stripped_contents[index]].append(index)
+        if duplicate_keys[index]:
+            by_content[duplicate_keys[index]].append(index)
         for title in title_sets[index]:
             by_title[title].append(index)
 
@@ -210,13 +231,13 @@ def build_candidate_edges(
     edges: list[CandidateEdge] = []
     token_sets = [set(feature.file_name_tokens) for feature in document_features]
     title_sets = [_content_title_keys(feature) for feature in document_features]
-    stripped_contents = [feature.content_text.strip() for feature in document_features]
+    duplicate_keys = [_duplicate_key(feature) for feature in document_features]
 
     for index, right_index in _candidate_pairs(
         document_features,
         token_sets=token_sets,
         title_sets=title_sets,
-        stripped_contents=stripped_contents,
+        duplicate_keys=duplicate_keys,
         min_filename_token_overlap=min_filename_token_overlap,
         min_content_similarity=min_content_similarity,
     ):
@@ -224,7 +245,7 @@ def build_candidate_edges(
         right = document_features[right_index]
         left_tokens = token_sets[index]
         right_tokens = token_sets[right_index]
-        left_content = stripped_contents[index]
+        left_key = duplicate_keys[index]
         shared_titles = title_sets[index] & title_sets[right_index]
         similarity = _jaccard(left_tokens, right_tokens)
         # A filename-dominant document was embedded from its file name, so
@@ -243,7 +264,7 @@ def build_candidate_edges(
         edge_type = None
         score = 0.0
 
-        if left_content and left_content == stripped_contents[right_index]:
+        if left_key and left_key == duplicate_keys[right_index]:
             edge_type = "near_duplicate"
             score = max(content_similarity, 1.0)
             evidence.append("identical_content")

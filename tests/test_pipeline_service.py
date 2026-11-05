@@ -2735,6 +2735,16 @@ def test_cluster_documents_merges_small_cluster_with_real_hdbscan_defaults() -> 
     assert result.metrics.small_clusters_merged >= 0
 
 
+# Identical content only counts as a near duplicate when there is enough of it
+# (see ``NEAR_DUPLICATE_MIN_CHARS``); a shared one-line title is not enough.
+_DUPLICATE_BODY = (
+    "Vector spaces, linear maps and their matrices.\n"
+    "A basis lets every vector be written uniquely as a linear combination.\n"
+    "The rank-nullity theorem relates the dimension of the kernel and image.\n"
+    "Eigenvalues are the roots of the characteristic polynomial det(A - tI).\n"
+)
+
+
 def test_pipeline_strong_semantic_components_do_not_prebind_canonical_labels(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -2749,8 +2759,8 @@ def test_pipeline_strong_semantic_components_do_not_prebind_canonical_labels(
     def fake_extract_contents(files, options):
         del options
         contents = [
-            "Linear Algebra Notes",
-            "Linear Algebra Notes",
+            "Linear Algebra Notes\n" + _DUPLICATE_BODY,
+            "Linear Algebra Notes\n" + _DUPLICATE_BODY,
             "Minecraft Guide",
         ]
         file_hashes = [f"hash-{index}" for index, _ in enumerate(files)]
@@ -2828,8 +2838,8 @@ def test_pipeline_near_duplicate_components_can_prebind_canonical_labels(
     def fake_extract_contents(files, options):
         del options
         contents = [
-            "Identical content block",
-            "Identical content block",
+            "Identical content block\n" + _DUPLICATE_BODY,
+            "Identical content block\n" + _DUPLICATE_BODY,
             "Different topic",
         ]
         file_hashes = [f"hash-{index}" for index, _ in enumerate(files)]
