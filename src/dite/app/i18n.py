@@ -288,6 +288,9 @@ class Messages:
     debug_cluster_name_async_request_failed: str
     debug_cluster_name_async_response_empty: str
     debug_cluster_name_async_response_invalid: str
+    warning_cluster_naming_fallback: str
+    warning_cluster_naming_first_error: str
+    warning_cluster_naming_reasoning_hint: str
     debug_analyzer_json_parse_failed: str
     debug_analyzer_api_failed: str
     warning_unsupported_file_format: str
@@ -676,6 +679,18 @@ ZH_CN = Messages(
     debug_cluster_name_async_response_invalid=(
         "簇 {label} 异步命名结果非法: wait={wait_sec:.3f}s, "
         "request={request_sec:.3f}s, fallback={fallback}"
+    ),
+    warning_cluster_naming_fallback=(
+        "LLM 簇命名有 {fallback}/{total} 个簇退回了启发式名称（请求失败 {failed} 个，"
+        "回复为空或只有推理内容 {empty} 个，名称不可用 {invalid} 个）。"
+        "使用 --verbose 查看每个簇的详情。"
+    ),
+    warning_cluster_naming_first_error="第一个簇命名错误：{error}",
+    warning_cluster_naming_reasoning_hint=(
+        "推理过程可能占满了命名输出：请保持 "
+        "request_profiles.cluster_naming.reasoning_mode: off，"
+        "按服务商设置 api.reasoning_param_style（见 docs/configuration.md），"
+        "或调大其 max_tokens。"
     ),
     debug_analyzer_json_parse_failed=(
         "JSON 解析失败 (尝试 {attempt}/{max_retries}): {error}"
@@ -1127,6 +1142,19 @@ EN = Messages(
     debug_cluster_name_async_response_invalid=(
         "Cluster {label} async naming response invalid: "
         "wait={wait_sec:.3f}s, request={request_sec:.3f}s, fallback={fallback}"
+    ),
+    warning_cluster_naming_fallback=(
+        "LLM cluster naming fell back to heuristic names for {fallback} of "
+        "{total} clusters (request failed: {failed}, empty or reasoning-only "
+        "reply: {empty}, unusable name: {invalid}). Run with --verbose for "
+        "per-cluster details."
+    ),
+    warning_cluster_naming_first_error="First cluster naming error: {error}",
+    warning_cluster_naming_reasoning_hint=(
+        "Reasoning may be using up the naming output: keep "
+        "request_profiles.cluster_naming.reasoning_mode: off, set "
+        "api.reasoning_param_style for your provider (see docs/configuration.md), "
+        "or raise its max_tokens."
     ),
     debug_analyzer_json_parse_failed=(
         "JSON parsing failed (attempt {attempt}/{max_retries}): {error}"

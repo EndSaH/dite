@@ -153,6 +153,7 @@ def _apply_llm_representations(
                     model=config.models.llm,
                     messages=[{"role": "user", "content": prompt}],
                     profile=config.request_profiles.cluster_representation,
+                    reasoning_param_style=config.api.reasoning_param_style,
                     response_format={"type": "json_object"},
                 )
             )

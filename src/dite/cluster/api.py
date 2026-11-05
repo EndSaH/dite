@@ -21,10 +21,9 @@ from dite.cluster.name import (
 )
 from dite.cluster.name import (
     _build_cluster_debug_labels,
-    _heuristic_cluster_name,
-    _is_invalid_cluster_name,
-    _normalize_cluster_name_text,
+    _cluster_name_from_async_response,
     _prepare_cluster_name_request_inputs,
+    _warn_on_cluster_naming_fallbacks,
     merge_clusters_by_name,
 )
 from dite.cluster.name import (
@@ -43,7 +42,16 @@ from dite.cluster.name import (
     _fallback_name_from_file_name as _fallback_name_from_file_name,
 )
 from dite.cluster.name import (
+    _heuristic_cluster_name as _heuristic_cluster_name,
+)
+from dite.cluster.name import (
+    _is_invalid_cluster_name as _is_invalid_cluster_name,
+)
+from dite.cluster.name import (
     _looks_like_author_line as _looks_like_author_line,
+)
+from dite.cluster.name import (
+    _normalize_cluster_name_text as _normalize_cluster_name_text,
 )
 from dite.cluster.post import (
     ALL_NOISE_DISTANCE_THRESHOLD as ALL_NOISE_DISTANCE_THRESHOLD,
@@ -337,6 +345,7 @@ def generate_all_cluster_names(
         cluster_indices_by_label[int(label)].append(index)
 
     logger = get_logger()
+    naming_outcomes: list[str] = []
     typed_runtime = request_runtime
     if typed_runtime is None:
         _ = client.chat.completions
@@ -357,6 +366,7 @@ def generate_all_cluster_names(
                 config=config,
                 llm_model=llm_model,
             )
+            naming_outcomes.append(name)
             return label, _display_cluster_name(label, name), len(cluster_indices)
 
         max_workers = max(
@@ -410,6 +420,7 @@ def generate_all_cluster_names(
                         model=model,
                         messages=[{"role": "user", "content": prompt}],
                         profile=request_profile,
+                        reasoning_param_style=config.api.reasoning_param_style,
                     )
                 )
             )
@@ -421,53 +432,16 @@ def generate_all_cluster_names(
             response_results,
             strict=False,
         ):
-            if response.error is not None:
-                fallback = _heuristic_cluster_name(selected_contents, selected_names)
-                logger.debug(
-                    t(
-                        "debug_cluster_name_async_request_failed",
-                        label=debug_labels.get(label, str(label)),
-                        error=response.error,
-                        wait_sec=response.queue_wait_sec,
-                        request_sec=response.request_elapsed_sec,
-                        fallback=fallback,
-                    )
-                )
-                results.append((label, _display_cluster_name(label, fallback), count))
-                continue
-
-            raw_name = (response.content or "").strip()
-            if not raw_name:
-                fallback = _heuristic_cluster_name(selected_contents, selected_names)
-                logger.debug(
-                    t(
-                        "debug_cluster_name_async_response_empty",
-                        label=debug_labels.get(label, str(label)),
-                        wait_sec=response.queue_wait_sec,
-                        request_sec=response.request_elapsed_sec,
-                        fallback=fallback,
-                    )
-                )
-                results.append((label, _display_cluster_name(label, fallback), count))
-                continue
-
-            name = _normalize_cluster_name_text(raw_name.split("\n")[0])
-            if _is_invalid_cluster_name(name):
-                fallback = _heuristic_cluster_name(selected_contents, selected_names)
-                logger.debug(
-                    t(
-                        "debug_cluster_name_async_response_invalid",
-                        label=debug_labels.get(label, str(label)),
-                        wait_sec=response.queue_wait_sec,
-                        request_sec=response.request_elapsed_sec,
-                        fallback=fallback,
-                    )
-                )
-                results.append((label, _display_cluster_name(label, fallback), count))
-                continue
-
+            name = _cluster_name_from_async_response(
+                response,
+                selected_contents,
+                selected_names,
+                debug_labels.get(label, str(label)),
+            )
+            naming_outcomes.append(name)
             results.append((label, _display_cluster_name(label, name), count))
 
+    _warn_on_cluster_naming_fallbacks(naming_outcomes)
     for label, display_name, count in results:
         cluster_names[label] = display_name
         logger.debug(

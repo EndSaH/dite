@@ -8,6 +8,7 @@ from openai import OpenAI
 
 from dite.app.config import Config
 from dite.app.i18n import get_locale, t
+from dite.util.llm import strip_reasoning_text
 from dite.util.log import get_logger
 
 
@@ -232,7 +233,9 @@ def analyze_document(
                 max_tokens=500,
             )
 
-            response_text = response.choices[0].message.content or "{}"
+            response_text = (
+                strip_reasoning_text(response.choices[0].message.content) or "{}"
+            )
 
             # 尝试解析 JSON
             data = json.loads(response_text)

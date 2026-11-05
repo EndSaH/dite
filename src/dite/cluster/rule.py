@@ -160,6 +160,7 @@ def apply_llm_adjudication(
                         }
                     ],
                     profile=config.request_profiles.cluster_adjudication,
+                    reasoning_param_style=config.api.reasoning_param_style,
                     response_format={"type": "json_object"},
                 )
             )

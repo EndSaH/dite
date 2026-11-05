@@ -23,6 +23,18 @@ class APIConfig:
     max_connections: int = 32
     max_keepalive_connections: int = 16
     keepalive_expiry_sec: float = 5.0
+    # How request_profiles.*.reasoning_mode reaches the server:
+    # auto: top-level enable_thinking for known hosts (SiliconFlow, DashScope,
+    #       ModelScope), nothing for any other host
+    # enable_thinking: top-level enable_thinking / thinking_budget fields
+    # chat_template_kwargs: chat_template_kwargs.enable_thinking (vLLM, SGLang)
+    # none: never send thinking fields
+    reasoning_param_style: str = "auto"
+
+
+REASONING_PARAM_STYLES = frozenset(
+    {"auto", "enable_thinking", "chat_template_kwargs", "none"}
+)
 
 
 @dataclass
@@ -397,6 +409,13 @@ def _dict_to_config(data: dict[str, Any]) -> Config:
         raise ValueError(
             f"topic_clustering.reducer must be one of "
             f"{sorted(TOPIC_CLUSTERING_REDUCERS)}, got {topic.reducer!r}"
+        )
+
+    if config.api.reasoning_param_style not in REASONING_PARAM_STYLES:
+        raise ValueError(
+            f"api.reasoning_param_style must be one of "
+            f"{sorted(REASONING_PARAM_STYLES)}, got "
+            f"{config.api.reasoning_param_style!r}"
         )
 
     if config.api.max_keepalive_connections > config.api.max_connections:

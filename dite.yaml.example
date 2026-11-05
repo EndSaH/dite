@@ -13,6 +13,13 @@ api:
   max_connections: 32                # Shared HTTP connection pool upper bound
   max_keepalive_connections: 16      # Shared keep-alive pool upper bound
   keepalive_expiry_sec: 5.0          # Keep-alive expiry
+  # How request_profiles.*.reasoning_mode is sent:
+  #   auto: enable_thinking for SiliconFlow / DashScope / ModelScope hosts,
+  #         nothing for other hosts (strict APIs reject unknown fields)
+  #   enable_thinking: always send top-level enable_thinking / thinking_budget
+  #   chat_template_kwargs: chat_template_kwargs.enable_thinking (vLLM, SGLang)
+  #   none: never send thinking fields
+  reasoning_param_style: auto
 
 # Model Configuration (Qwen3 series recommended)
 models:
@@ -24,7 +31,7 @@ models:
 request_profiles:
   cluster_naming:
     max_tokens: 50
-    reasoning_mode: "off"              # default / off / on
+    reasoning_mode: "off"              # default / off / on (see api.reasoning_param_style)
     thinking_budget: null
   cluster_adjudication:                # JSON answers need a larger budget
     max_tokens: 300

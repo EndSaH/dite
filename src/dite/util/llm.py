@@ -1,29 +1,98 @@
 """LLM request helpers."""
 
 import json
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from openai import APIError, AsyncOpenAI, OpenAI
 
 from dite.app.config import ChatCompletionProfileConfig
 
+# Hosts whose OpenAI-compatible API takes top-level ``enable_thinking`` and
+# ``thinking_budget`` fields. DashScope also rejects non-streaming Qwen3
+# calls unless thinking is switched off explicitly.
+_ENABLE_THINKING_DOMAINS = ("siliconflow.cn", "siliconflow.com", "modelscope.cn")
+_DASHSCOPE_HOST_RE = re.compile(r"dashscope(?:-[a-z0-9]+)?\.aliyuncs\.com")
+
+_REASONING_BLOCK_RE = re.compile(
+    r"<(think|thinking)\s*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL
+)
+_REASONING_OPEN_RE = re.compile(r"<think(?:ing)?\s*>", re.IGNORECASE)
+_REASONING_CLOSE_RE = re.compile(r"</think(?:ing)?\s*>", re.IGNORECASE)
+
+
+def strip_reasoning_text(content: str | None) -> str:
+    """Return a model reply without its ``<think>`` reasoning.
+
+    Servers without a reasoning parser (vLLM or SGLang started without
+    ``--reasoning-parser``, for example) put Qwen3 / DeepSeek-R1 reasoning
+    into ``content``. A reply cut off by ``max_tokens`` ends inside an
+    unclosed ``<think>``, and chat templates that open the block in the
+    prompt leave only ``</think>``; reasoning is dropped in every case.
+    """
+    text = _REASONING_BLOCK_RE.sub("", content or "")
+    closing_tags = list(_REASONING_CLOSE_RE.finditer(text))
+    if closing_tags:
+        text = text[closing_tags[-1].end() :]
+    opening_tag = _REASONING_OPEN_RE.search(text)
+    if opening_tag:
+        text = text[: opening_tag.start()]
+    return text.strip()
+
+
+def _client_host(client: OpenAI | AsyncOpenAI) -> str:
+    base_url = str(getattr(client, "base_url", "") or "")
+    if "://" not in base_url:
+        base_url = f"//{base_url}"
+    try:
+        return (urlsplit(base_url).hostname or "").casefold()
+    except ValueError:
+        return ""
+
+
+def _resolve_reasoning_param_style(
+    client: OpenAI | AsyncOpenAI, reasoning_param_style: str
+) -> str:
+    """Pick how thinking controls are sent; ``auto`` only trusts known hosts."""
+    if reasoning_param_style != "auto":
+        return reasoning_param_style
+    host = _client_host(client)
+    if _DASHSCOPE_HOST_RE.fullmatch(host) or any(
+        host == domain or host.endswith(f".{domain}")
+        for domain in _ENABLE_THINKING_DOMAINS
+    ):
+        return "enable_thinking"
+    # Unknown fields make strict servers (api.openai.com among them) answer
+    # 400, so other hosts get nothing unless the user picks a style.
+    return "none"
+
 
 def _translate_reasoning_controls(
     client: OpenAI | AsyncOpenAI,
     profile: ChatCompletionProfileConfig,
+    reasoning_param_style: str = "auto",
 ) -> dict[str, Any]:
     """Translate generic reasoning controls into provider-specific request fields."""
     if profile.reasoning_mode == "default" and profile.thinking_budget is None:
         return {}
 
-    base_url = str(getattr(client, "base_url", "")).casefold()
-    if "siliconflow.cn" in base_url:
+    style = _resolve_reasoning_param_style(client, reasoning_param_style)
+    if style == "enable_thinking":
         extra_body: dict[str, Any] = {}
         if profile.reasoning_mode != "default":
             extra_body["enable_thinking"] = profile.reasoning_mode == "on"
         if profile.thinking_budget is not None:
             extra_body["thinking_budget"] = profile.thinking_budget
         return extra_body
+
+    if style == "chat_template_kwargs" and profile.reasoning_mode != "default":
+        # Qwen3 chat templates read enable_thinking; they have no budget knob.
+        return {
+            "chat_template_kwargs": {
+                "enable_thinking": profile.reasoning_mode == "on",
+            }
+        }
 
     return {}
 
@@ -34,9 +103,13 @@ def build_chat_completion_kwargs(
     model: str,
     messages: list[dict[str, Any]],
     profile: ChatCompletionProfileConfig | None = None,
+    reasoning_param_style: str = "auto",
     **overrides: Any,
 ) -> dict[str, Any]:
-    """Build chat completion kwargs from task intent plus provider adaptation."""
+    """Build chat completion kwargs from task intent plus provider adaptation.
+
+    ``reasoning_param_style`` is ``config.api.reasoning_param_style``.
+    """
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -49,7 +122,9 @@ def build_chat_completion_kwargs(
     kwargs.setdefault("max_tokens", profile.max_tokens)
 
     extra_body = dict(kwargs.get("extra_body") or {})
-    extra_body.update(_translate_reasoning_controls(client, profile))
+    extra_body.update(
+        _translate_reasoning_controls(client, profile, reasoning_param_style)
+    )
     if extra_body:
         kwargs["extra_body"] = extra_body
 
@@ -108,9 +183,10 @@ def should_retry_api_error(exc: APIError) -> bool:
 def parse_json_object(content: str) -> dict[str, Any] | None:
     """Parse a JSON object from a model reply, tolerating code fences and prose.
 
-    Returns ``None`` when no JSON object can be recovered.
+    ``<think>`` reasoning is dropped first. Returns ``None`` when no JSON
+    object can be recovered.
     """
-    text = (content or "").strip()
+    text = strip_reasoning_text(content)
     if not text:
         return None
     candidates = [text]

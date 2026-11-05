@@ -10,15 +10,21 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from openai import APIError, OpenAI
+from rich.markup import escape
 from sklearn.metrics.pairwise import cosine_distances
 
 from dite.app.config import Config
 from dite.app.i18n import get_locale, t
-from dite.util.api import AsyncRequestRuntime, ChatCompletionRequest
+from dite.util.api import (
+    AsyncRequestRuntime,
+    ChatCompletionRequest,
+    ChatCompletionResult,
+)
 from dite.util.llm import (
     build_chat_completion_kwargs,
     format_api_error,
     should_retry_api_error,
+    strip_reasoning_text,
 )
 from dite.util.log import get_logger
 
@@ -29,6 +35,9 @@ CLUSTER_NAME_CONTENT_LIMIT = 600
 CLUSTER_NAME_EXCERPT_LIMIT = 180
 CLUSTER_NAME_OUTPUT_LIMIT = 24
 CLUSTER_NAME_MAX_RETRIES = 3
+# Warn once at least this share of clusters kept a heuristic name.
+CLUSTER_NAME_FALLBACK_WARN_RATIO = 0.5
+_CLUSTER_NAME_ERROR_PREVIEW_LIMIT = 300
 NON_MERGEABLE_CLUSTER_NAMES = {"", "未命名", "Unnamed"}
 PLACEHOLDER_CLUSTER_NAMES = {
     "image",
@@ -53,6 +62,33 @@ CLUSTER_NAME_STOPWORDS = {
     "to",
     "with",
 }
+# "Name: ...", "**Category:** ...", "名称：..." labels in front of a reply.
+_CLUSTER_NAME_LABEL_RE = re.compile(
+    r"^(?:(?:category|cluster|folder)\s+)?(?:name|category|topic)\s*[:：]\s*"
+    r"|^(?:类别|簇|分类)?(?:名称|名字|名|类别|主题)\s*[:：]\s*",
+    re.IGNORECASE,
+)
+_REASONING_TAG_RE = re.compile(r"</?think(?:ing)?\b", re.IGNORECASE)
+
+# Why a cluster kept a heuristic name instead of the model's answer.
+_FALLBACK_FAILED = "failed"
+_FALLBACK_EMPTY = "empty"
+_FALLBACK_INVALID = "invalid"
+
+
+class _ClusterName(str):
+    """A cluster name that records why the model's answer was not used."""
+
+    fallback_reason: str | None
+    error: str
+
+    def __new__(
+        cls, value: str, fallback_reason: str | None = None, error: str = ""
+    ) -> _ClusterName:
+        name = super().__new__(cls, value)
+        name.fallback_reason = fallback_reason
+        name.error = error
+        return name
 
 
 def _prepare_cluster_name_request_inputs(
@@ -129,6 +165,9 @@ def _is_invalid_cluster_name(text: str) -> bool:
         return True
     if re.fullmatch(r"[\W_]+", cleaned):
         return True
+    # Reasoning tags and other markup such as "<think>" or "<|im_end|>".
+    if _REASONING_TAG_RE.search(cleaned) or re.fullmatch(r"<[^<>]*>", cleaned):
+        return True
 
     lowered = cleaned.casefold()
     if lowered in PLACEHOLDER_CLUSTER_NAMES:
@@ -136,6 +175,19 @@ def _is_invalid_cluster_name(text: str) -> bool:
     if re.fullmatch(r"(page|slide)\s*\d+", lowered):
         return True
     return bool(_looks_like_author_line(cleaned))
+
+
+def _cluster_name_from_reply(content: str) -> str:
+    """Extract the name candidate from a model reply.
+
+    Reasoning blocks, Markdown emphasis and "Name:" style labels are removed;
+    the result may still be invalid and must go through the usual checks.
+    """
+    answer = strip_reasoning_text(content)
+    first_line = next((line for line in answer.splitlines() if line.strip()), "")
+    name = _normalize_cluster_name_text(first_line)
+    name = _CLUSTER_NAME_LABEL_RE.sub("", name, count=1)
+    return _normalize_cluster_name_text(name.rstrip("*"))
 
 
 def _fallback_name_from_file_name(file_name: str) -> str:
@@ -306,32 +358,34 @@ def generate_cluster_name(
                     model=model,
                     messages=[{"role": "user", "content": prompt}],
                     profile=request_profile,
+                    reasoning_param_style=config.api.reasoning_param_style,
                 )
             )
             choice = response.choices[0]
             message = choice.message
             raw_name = message.content or ""
             reasoning_content = getattr(message, "reasoning_content", None)
-            if not raw_name.strip():
+            answer = strip_reasoning_text(raw_name)
+            if not answer:
                 logger.debug(
                     t(
                         "debug_cluster_name_empty_response",
                         model=response.model,
                         finish_reason=choice.finish_reason,
-                        reasoning_chars=len(reasoning_content or ""),
+                        reasoning_chars=len(reasoning_content or raw_name.strip()),
                     )
                 )
                 fallback = _heuristic_cluster_name(sample_contents, sample_names)
                 logger.debug(t("debug_cluster_name_empty_fallback", fallback=fallback))
-                return fallback
+                return _ClusterName(fallback, _FALLBACK_EMPTY)
 
-            name = _normalize_cluster_name_text(raw_name.split("\n")[0])
+            name = _cluster_name_from_reply(answer)
             if _is_invalid_cluster_name(name):
                 fallback = _heuristic_cluster_name(sample_contents, sample_names)
                 logger.debug(
                     t("debug_cluster_name_invalid_fallback", fallback=fallback)
                 )
-                return fallback
+                return _ClusterName(fallback, _FALLBACK_INVALID)
             return name[:CLUSTER_NAME_OUTPUT_LIMIT]
         except APIError as exc:
             last_error = format_api_error(exc)
@@ -358,7 +412,92 @@ def generate_cluster_name(
             error=last_error,
         )
     )
-    return fallback
+    return _ClusterName(fallback, _FALLBACK_FAILED, last_error)
+
+
+def _cluster_name_from_async_response(
+    response: ChatCompletionResult,
+    selected_contents: list[str],
+    selected_names: list[str],
+    debug_label: str,
+) -> str:
+    """Return the cluster name for one batched naming response."""
+    logger = get_logger()
+    timing = {
+        "label": debug_label,
+        "wait_sec": response.queue_wait_sec,
+        "request_sec": response.request_elapsed_sec,
+    }
+    if response.error is not None:
+        fallback = _heuristic_cluster_name(selected_contents, selected_names)
+        logger.debug(
+            t(
+                "debug_cluster_name_async_request_failed",
+                error=response.error,
+                fallback=fallback,
+                **timing,
+            )
+        )
+        error = response.error
+        error_text = (
+            format_api_error(error) if isinstance(error, APIError) else str(error)
+        )
+        return _ClusterName(fallback, _FALLBACK_FAILED, error_text)
+
+    answer = strip_reasoning_text(response.content)
+    if not answer:
+        fallback = _heuristic_cluster_name(selected_contents, selected_names)
+        logger.debug(
+            t("debug_cluster_name_async_response_empty", fallback=fallback, **timing)
+        )
+        return _ClusterName(fallback, _FALLBACK_EMPTY)
+
+    name = _cluster_name_from_reply(answer)
+    if _is_invalid_cluster_name(name):
+        fallback = _heuristic_cluster_name(selected_contents, selected_names)
+        logger.debug(
+            t("debug_cluster_name_async_response_invalid", fallback=fallback, **timing)
+        )
+        return _ClusterName(fallback, _FALLBACK_INVALID)
+    return name
+
+
+def _warn_on_cluster_naming_fallbacks(names: list[str]) -> None:
+    """Tell the user when many clusters kept heuristic names, and why."""
+    reasons = [getattr(name, "fallback_reason", None) for name in names]
+    fallback_count = sum(reason is not None for reason in reasons)
+    if fallback_count == 0 or fallback_count < (
+        len(names) * CLUSTER_NAME_FALLBACK_WARN_RATIO
+    ):
+        return
+
+    logger = get_logger()
+    failed_count = reasons.count(_FALLBACK_FAILED)
+    empty_count = reasons.count(_FALLBACK_EMPTY)
+    logger.warning(
+        t(
+            "warning_cluster_naming_fallback",
+            fallback=fallback_count,
+            total=len(names),
+            failed=failed_count,
+            empty=empty_count,
+            invalid=reasons.count(_FALLBACK_INVALID),
+        )
+    )
+    if failed_count:
+        first_error = next(
+            getattr(name, "error", "")
+            for name, reason in zip(names, reasons, strict=True)
+            if reason == _FALLBACK_FAILED
+        )
+        logger.warning(
+            t(
+                "warning_cluster_naming_first_error",
+                error=escape(first_error[:_CLUSTER_NAME_ERROR_PREVIEW_LIMIT]),
+            )
+        )
+    if empty_count:
+        logger.warning(t("warning_cluster_naming_reasoning_hint"))
 
 
 def merge_clusters_by_name(
@@ -439,6 +578,7 @@ def generate_all_cluster_names(
         cluster_indices_by_label[int(label)].append(index)
 
     logger = get_logger()
+    naming_outcomes: list[str] = []
 
     if request_runtime is None:
         _ = client.chat.completions
@@ -459,6 +599,7 @@ def generate_all_cluster_names(
                 config=config,
                 llm_model=llm_model,
             )
+            naming_outcomes.append(name)
             return label, _display_cluster_name(label, name), len(cluster_indices)
 
         max_workers = max(
@@ -512,6 +653,7 @@ def generate_all_cluster_names(
                         model=model,
                         messages=[{"role": "user", "content": prompt}],
                         profile=request_profile,
+                        reasoning_param_style=config.api.reasoning_param_style,
                     )
                 )
             )
@@ -523,53 +665,16 @@ def generate_all_cluster_names(
             response_results,
             strict=False,
         ):
-            if response.error is not None:
-                fallback = _heuristic_cluster_name(selected_contents, selected_names)
-                logger.debug(
-                    t(
-                        "debug_cluster_name_async_request_failed",
-                        label=debug_labels.get(label, str(label)),
-                        error=response.error,
-                        wait_sec=response.queue_wait_sec,
-                        request_sec=response.request_elapsed_sec,
-                        fallback=fallback,
-                    )
-                )
-                results.append((label, _display_cluster_name(label, fallback), count))
-                continue
-
-            raw_name = (response.content or "").strip()
-            if not raw_name:
-                fallback = _heuristic_cluster_name(selected_contents, selected_names)
-                logger.debug(
-                    t(
-                        "debug_cluster_name_async_response_empty",
-                        label=debug_labels.get(label, str(label)),
-                        wait_sec=response.queue_wait_sec,
-                        request_sec=response.request_elapsed_sec,
-                        fallback=fallback,
-                    )
-                )
-                results.append((label, _display_cluster_name(label, fallback), count))
-                continue
-
-            name = _normalize_cluster_name_text(raw_name.split("\n")[0])
-            if _is_invalid_cluster_name(name):
-                fallback = _heuristic_cluster_name(selected_contents, selected_names)
-                logger.debug(
-                    t(
-                        "debug_cluster_name_async_response_invalid",
-                        label=debug_labels.get(label, str(label)),
-                        wait_sec=response.queue_wait_sec,
-                        request_sec=response.request_elapsed_sec,
-                        fallback=fallback,
-                    )
-                )
-                results.append((label, _display_cluster_name(label, fallback), count))
-                continue
-
+            name = _cluster_name_from_async_response(
+                response,
+                selected_contents,
+                selected_names,
+                debug_labels.get(label, str(label)),
+            )
+            naming_outcomes.append(name)
             results.append((label, _display_cluster_name(label, name), count))
 
+    _warn_on_cluster_naming_fallbacks(naming_outcomes)
     for label, display_name, count in results:
         cluster_names[label] = display_name
         logger.debug(

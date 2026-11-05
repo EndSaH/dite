@@ -58,10 +58,12 @@ YAML 中的字符串值支持环境变量展开。
 - `max_connections`
 - `max_keepalive_connections`
 - `keepalive_expiry_sec`
+- `reasoning_param_style`：`request_profiles.*.reasoning_mode` 以什么请求字段发给服务端，默认 `auto`，见下文 `request_profiles`
 
 当前校验规则：
 
 - `api.max_keepalive_connections` 必须小于等于 `api.max_connections`
+- `api.reasoning_param_style` 必须是 `auto`、`enable_thinking`、`chat_template_kwargs`、`none` 之一
 
 ## `models`
 
@@ -99,6 +101,15 @@ YAML 中的字符串值支持环境变量展开。
 
 - `false` 变成 `off`
 - `true` 变成 `on`
+
+`reasoning_mode: off/on` 和 `thinking_budget` 不是 OpenAI 标准参数，按 `api.reasoning_param_style` 翻译成服务端字段（`reasoning_mode: default` 且没有 `thinking_budget` 时什么都不发）：
+
+- `auto`（默认）：`api.base_url` 的主机是 SiliconFlow（`siliconflow.cn` / `siliconflow.com`）、阿里云 DashScope（`dashscope*.aliyuncs.com`）或 ModelScope（`modelscope.cn`）时，发送顶层 `enable_thinking` / `thinking_budget`；其他主机什么都不发，因为官方 OpenAI 接口等严格服务会对未知参数返回 400
+- `enable_thinking`：总是发送顶层 `enable_thinking` / `thinking_budget`
+- `chat_template_kwargs`：发送 `chat_template_kwargs: {enable_thinking: ...}`，适用于 vLLM、SGLang 部署的 Qwen3；这种写法没有 `thinking_budget`
+- `none`：从不发送推理控制字段
+
+服务端没有关闭推理、又没有把推理过程拆到 `reasoning_content` 时，回复里会带 `<think>…</think>`。DITE 在使用簇命名、边裁决、簇表示和文档分析的回复前会去掉这些推理块（包括被 `max_tokens` 截断、没有闭合的 `<think>`）。簇命名请求失败、回复去掉推理后为空、或名称不可用（例如仍是 `<think>` 这类标签）时，该簇退回到由标题或文件名生成的启发式名称；至少一半的簇退回时会打印一条 warning，给出这三种原因各自的数量和第一个请求错误。
 
 ## `clustering`
 
